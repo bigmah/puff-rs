@@ -1,11 +1,12 @@
 #!/bin/bash
 # Build an env for PufferLib 5.0, on a Mac or on Linux.
 #
-#   ./build.sh [platformer|sm64]
+#   ./build.sh [platformer|sm64|sort|kronecker_factorization]
 #
 #       build/vecenv_<env>.dylib    the env in a vecenv, for the trainer to train on
 #                                   (.so on Linux)
 #       build/platformer            human play
+#       build/kronecker_factorization   count and list the factorizations of an M x N
 #       build/sm64_tool             savestates, watching, benchmarking
 #
 # PufferLib's own build.sh compiles an env from its ocean/ into the CUDA trainer,
@@ -247,6 +248,11 @@ echo "Built: $BUILD/vecenv_$ENV.$LIB_EXT"
 
 if [ "$ENV" = platformer ]; then
     "$CC" "${CFLAGS[@]}" "$ENV_DIR/$ENV.c" "${RAYLIB_LIBS[@]}" -lm -o "$BUILD/$ENV"
+    echo "Built: $BUILD/$ENV"
+fi
+
+if [ "$ENV" = kronecker_factorization ]; then
+    "$CC" -O2 -Wall "$ENV_DIR/$ENV.c" -lm -o "$BUILD/$ENV"
     echo "Built: $BUILD/$ENV"
 fi
 
