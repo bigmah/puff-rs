@@ -15,12 +15,14 @@
  * runs to it, the runs that seed the archive -- is in a folder of its own,
  * build/sm64/<star>/.
  *
- * Reward is the star, the clock, and novelty. The star pays STAR_REWARD and ends
- * the episode the frame Mario touches it: that star and no other, by its flag
- * going on in the save file. Every frame costs time_penalty / max_ticks, so an
- * episode that runs out of time has paid time_penalty in all. Nothing tells the
- * policy where the star is or pays for getting nearer to it: it sees what Mario
- * is doing and where he is, and finds out about the star by taking it.
+ * Reward is the star, the clock, novelty, and -- for a star whose place the
+ * config gives (star_x, star_y, star_z) -- progress toward it. The star pays
+ * STAR_REWARD and ends the episode the frame Mario touches it: that star and no
+ * other, by its flag going on in the save file. Every frame costs time_penalty /
+ * max_ticks, so an episode that runs out of time has paid time_penalty in all.
+ * Progress pays for each new closest approach to the star, less the later it
+ * comes (see progress). With no place given, nothing tells the policy where the
+ * star is: it finds out by taking it, and the env then prints where that was.
  *
  * With the goal and the clock alone, every episode is worth exactly
  * -time_penalty until the first success. When the goal was the castle's front
@@ -77,8 +79,12 @@
  * more: stopping the clock early is not a way to lose less. With respawn on, a
  * death puts the game back instead and the episode carries on.
  *
- * The observation is Mario's state read out of memory, and, with picture_width
- * set, the game's picture after it: the frame the console's video interface is
+ * The observation is everything about Mario that can be read out of memory --
+ * position, velocity, facing, spin, the stick as the game read it, the floor,
+ * wall and ceiling, what he is doing and was doing, his timers and flags --
+ * the floor around him (the floor probes), where the star is from him when
+ * that is known, and the clock; and, with picture_width set, the game's
+ * picture after it: the frame the console's video interface is
  * about to show, which N64Bundler reads without knowing what game it is (see
  * the picture). The reward reads memory whatever the policy sees.
  *
@@ -177,25 +183,64 @@ typedef float obs_t;
 #define PAINTING_NODE 0x0A /* where a course's painting puts Mario, in every course */
 
 /* struct MarioState */
-#define M_INPUT 0x02   /* u16 */
-#define M_ACTION 0x0C  /* u32 */
-#define M_ACTION_STATE 0x18
-#define M_ACTION_TIMER 0x1A
-#define M_INTENDED_MAG 0x20 /* f32 */
-#define M_INTENDED_YAW 0x24 /* s16, the world direction the stick asked for */
-#define M_FACE_ANGLE 0x2C   /* Vec3s: pitch, yaw, roll */
-#define M_POS 0x3C          /* Vec3f */
-#define M_VEL 0x48          /* Vec3f */
-#define M_FORWARD_VEL 0x54  /* f32 */
-#define M_WALL 0x60
-#define M_FLOOR 0x68
-#define M_CEIL_HEIGHT 0x6C
-#define M_FLOOR_HEIGHT 0x70
-#define M_WATER_LEVEL 0x76 /* s16 */
-#define M_HEALTH 0xAE      /* s16, 0x880 is full and under 0x100 is dead */
-#define SURFACE_NORMAL_Y 0x20 /* f32 inside struct Surface */
+#define M_INPUT 0x02            /* u16, INPUT_* flags */
+#define M_FLAGS 0x04            /* u32, MARIO_* flags: caps, sounds, action flags */
+#define M_ACTION 0x0C           /* u32 */
+#define M_PREV_ACTION 0x10      /* u32 */
+#define M_ACTION_STATE 0x18     /* u16 */
+#define M_ACTION_TIMER 0x1A     /* u16 */
+#define M_ACTION_ARG 0x1C       /* u32 */
+#define M_INTENDED_MAG 0x20     /* f32, how far the stick is pushed, 0 to 32 */
+#define M_INTENDED_YAW 0x24     /* s16, the world direction the stick asked for */
+#define M_INVINC_TIMER 0x26     /* s16 */
+#define M_FRAMES_SINCE_A 0x28   /* u8 */
+#define M_FRAMES_SINCE_B 0x29   /* u8 */
+#define M_WALL_KICK_TIMER 0x2A  /* u8 */
+#define M_DOUBLE_JUMP_TIMER 0x2B /* u8 */
+#define M_FACE_ANGLE 0x2C       /* Vec3s: pitch, yaw, roll */
+#define M_ANGLE_VEL 0x32        /* Vec3s */
+#define M_SLIDE_YAW 0x38        /* s16 */
+#define M_TWIRL_YAW 0x3A        /* s16 */
+#define M_POS 0x3C              /* Vec3f */
+#define M_VEL 0x48              /* Vec3f */
+#define M_FORWARD_VEL 0x54      /* f32 */
+#define M_SLIDE_VEL_X 0x58      /* f32 */
+#define M_SLIDE_VEL_Z 0x5C      /* f32 */
+#define M_WALL 0x60             /* struct Surface* */
+#define M_CEIL 0x64             /* struct Surface* */
+#define M_FLOOR 0x68            /* struct Surface* */
+#define M_CEIL_HEIGHT 0x6C      /* f32 */
+#define M_FLOOR_HEIGHT 0x70     /* f32 */
+#define M_FLOOR_ANGLE 0x74      /* s16 */
+#define M_WATER_LEVEL 0x76      /* s16 */
+#define M_HEALTH 0xAE           /* s16, 0x880 is full and under 0x100 is dead */
+#define M_PEAK_HEIGHT 0xBC      /* f32, the top of the current jump or fall */
 
-/* An action is an index in its low bits, a group in 0x1C0, and flags above. */
+/* struct Surface: a triangle of the course's collision */
+#define SURFACE_TYPE 0x00       /* s16 */
+#define SURFACE_VERTEX1 0x0A    /* Vec3s, then VERTEX2 at 0x10 and VERTEX3 at 0x16 */
+#define SURFACE_NORMAL 0x1C     /* Vec3f */
+#define SURFACE_NORMAL_Y 0x20
+#define SURFACE_ORIGIN_OFFSET 0x28 /* f32 */
+
+/* gStaticSurfacePartition: the course's fixed collision, cut into 16 by 16
+ * columns of 1024 units, each three lists (floors, ceilings, walls) of
+ * struct SurfaceNode { next, surface }, the floors highest first. The game's
+ * own find_floor walks these; so do the floor probes. Checked against the
+ * running game: the floor it finds under Mario is mario->floor, at
+ * mario->floorHeight (`sm64_tool floors`). */
+#define STATIC_SURFACE_PARTITION 0x8038BE98
+#define PARTITION_CELLS 16
+#define PARTITION_CELL_SIZE 1024
+
+/* An action is an index in its low six bits, a group in 0x1C0, and flags above. */
+#define ACT_ID_MASK 0x3F
+#define ACT_GROUP_SHIFT 6
+#define ACT_GROUPS 8
+#define ACT_IDS 64
+#define ACT_FLAG_FIRST 9
+#define ACT_FLAGS 23 /* bits 9 to 31 */
+#define INPUT_BITS 16
 #define ACT_GROUP_MASK 0x1C0
 #define ACT_GROUP_CUTSCENE 0x100 /* dying, warping, doors, dialog */
 #define ACT_FLAG_STATIONARY (1 << 9)
@@ -342,29 +387,57 @@ static int sm64_goal_parse(const char* star, int act, SM64Goal* goal, char* erro
     return 1;
 }
 
-/* The observation, in the order it is written. */
+/* The floor probes: the height of the floor around Mario, at PROBE_DIRECTIONS
+ * directions round from the way he faces (the first straight ahead), each at
+ * the distances in sm64_probe_reach. */
+#define PROBE_DIRECTIONS 8
+#define PROBE_DISTANCES 4
+#define PROBES (PROBE_DIRECTIONS * PROBE_DISTANCES)
+
+/* The observation, in the order it is written: everything about Mario that can
+ * be read out of the console's memory, the floor around him, where the star is
+ * from him, and the clock. */
 enum {
     OBS_POS_X, OBS_POS_Y, OBS_POS_Z,
     OBS_VEL_X, OBS_VEL_Y, OBS_VEL_Z,
     OBS_FORWARD_VEL,
-    OBS_SPEED,
+    OBS_SPEED,               /* ground covered last step, per frame */
     OBS_FACE_SIN, OBS_FACE_COS,
-    OBS_PITCH,
-    OBS_CAMERA_SIN, OBS_CAMERA_COS,
+    OBS_PITCH, OBS_ROLL,
+    OBS_ANGLE_VEL_X, OBS_ANGLE_VEL_Y, OBS_ANGLE_VEL_Z,
+    OBS_SLIDE_YAW_SIN, OBS_SLIDE_YAW_COS, /* relative to the facing */
+    OBS_SLIDE_VEL_X, OBS_SLIDE_VEL_Z,
+    OBS_TWIRL_YAW_SIN, OBS_TWIRL_YAW_COS,
+    OBS_INTENDED_MAG,
+    OBS_INTENDED_SIN, OBS_INTENDED_COS,   /* relative to the facing */
+    OBS_CAMERA_SIN, OBS_CAMERA_COS,       /* relative to the facing */
     OBS_HEIGHT_ABOVE_FLOOR,
-    OBS_FLOOR_SLOPE,
+    OBS_FLOOR_HEIGHT,
     OBS_HEADROOM,
-    OBS_TOUCHING_WALL,
+    OBS_FLOOR, OBS_FLOOR_NX, OBS_FLOOR_NY, OBS_FLOOR_NZ, /* the normal turned into his frame: x right, z ahead */
+    OBS_FLOOR_ANGLE_SIN, OBS_FLOOR_ANGLE_COS, OBS_FLOOR_TYPE,
+    OBS_WALL, OBS_WALL_NX, OBS_WALL_NY, OBS_WALL_NZ,
+    OBS_CEIL,
     OBS_WATER,
-    OBS_ON_GROUND,
-    OBS_GROUP_STATIONARY, OBS_GROUP_MOVING, OBS_GROUP_AIRBORNE, OBS_GROUP_SUBMERGED,
-    OBS_GROUP_CUTSCENE, OBS_GROUP_AUTOMATIC, OBS_GROUP_OBJECT,
-    OBS_ACTION_TIMER, OBS_ACTION_STATE,
     OBS_HEALTH,
+    OBS_PEAK_ABOVE,          /* how far below the top of his jump or fall he is */
+    OBS_FRAMES_SINCE_A, OBS_FRAMES_SINCE_B,
+    OBS_WALL_KICK_TIMER, OBS_DOUBLE_JUMP_TIMER, OBS_INVINC_TIMER,
+    OBS_ACTION_TIMER, OBS_ACTION_STATE, OBS_ACTION_ARG,
+    OBS_ACTION_GROUP,                              /* one-hot, ACT_GROUPS */
+    OBS_ACTION_ID = OBS_ACTION_GROUP + ACT_GROUPS, /* one-hot, ACT_IDS */
+    OBS_ACTION_FLAGS = OBS_ACTION_ID + ACT_IDS,    /* bits 9 to 31 */
+    OBS_PREV_GROUP = OBS_ACTION_FLAGS + ACT_FLAGS, /* one-hot */
+    OBS_PREV_ID = OBS_PREV_GROUP + ACT_GROUPS,     /* one-hot */
+    OBS_INPUT = OBS_PREV_ID + ACT_IDS,             /* INPUT_* bits */
+    OBS_MARIO_FLAGS = OBS_INPUT + INPUT_BITS,      /* MARIO_* bits, the low 16 */
+    OBS_PROBES = OBS_MARIO_FLAGS + 16,             /* the floor around him, PROBES of them */
+    OBS_STAR_KNOWN = OBS_PROBES + PROBES,          /* 1 when the config says where the star is */
+    OBS_STAR_DX, OBS_STAR_DY, OBS_STAR_DZ,
+    OBS_STAR_DISTANCE,
+    OBS_STAR_SIN, OBS_STAR_COS, /* the star's direction, relative to the facing */
+    OBS_STAR_PROGRESS,          /* the closest he has been this episode, as a share of the way from the start */
     OBS_TIME_LEFT,
-    OBS_FLAG_STATIONARY, OBS_FLAG_MOVING, OBS_FLAG_AIR, OBS_FLAG_SWIMMING,
-    OBS_FLAG_SLIDING, OBS_FLAG_DIVING, OBS_FLAG_POLE, OBS_FLAG_HANGING,
-    OBS_FLAG_IDLE, OBS_FLAG_ATTACKING,
     NUM_OBS
 };
 
@@ -389,13 +462,16 @@ struct Log {
     float frames;          /* frames to the star, the whole clock without it: what is minimized */
     float novelty;         /* what novelty paid this episode */
     float ghost;           /* what beating the archive to cubes on the way to the star paid this episode */
+    float progress;        /* share of the way to the star from the start covered at the closest, 0 with no star_x */
+    float closest;         /* the closest he got to the star, in units */
+    float progress_reward; /* what getting closer paid this episode */
     float cells;           /* cubes entered this episode */
     float explored;        /* cubes any game has ever entered, as of the end of this episode */
     float from_start;      /* fraction of episodes that began where the task does, not from the archive */
     float start_perf;      /* fraction that began there and took the star: the star rate is start_perf / from_start */
-    float archive;         /* cubes in the archive */
+    float archive;         /* cells in the archive */
     float replayed;        /* frames replayed to reach the episode's starting cube, 0 from the real start */
-    float star_cubes;      /* cubes that have been on the way to the star */
+    float star_cubes;      /* archive cells that have been on the way to the star */
     float frontier;        /* frames before the star that episodes on the demo start at, 0 with no demo */
     float distance;        /* the length of the path he ran */
     float top_speed;       /* the best single frame of it, units per frame */
@@ -425,9 +501,16 @@ struct Env {
     float novelty;        /* reward for entering a cube no episode has entered before, fading as 1 / sqrt(episodes) */
     float novelty_episode; /* reward for entering any cube for the first time this episode, which never fades */
     float novelty_cell;   /* the side of a cube, in units */
+    float cell_speed;     /* the archive's cells: speed buckets this many units a frame wide, 0 for position only */
+    int cell_heading;     /* and this many buckets of facing; 0 or 1 for none */
+    float star_x, star_y, star_z; /* where the star is; all three 0 for not known */
+    float progress;       /* reward the whole way from the start to the star is worth, paid at each new closest approach */
+    float progress_hurry; /* the share of that pay that is lost as the clock runs: 1 pays nothing at the last frame */
     int respawn;          /* a death puts the game back and the episode goes on, rather than ending it */
     float go_explore;     /* share of episodes that start from a cube in the archive */
     float go_explore_star; /* share of those that start from a cube on the way to the star, once there is one */
+    float go_explore_frames; /* the longest way the archive keeps, in episodes' worth of frames */
+    float go_explore_near; /* share of the rest that start from the cells nearest the star, with its place known */
     int go_explore_seed;  /* start the archive with the runs on file rather than with nothing */
     float ghost;          /* reward per frame sooner than the archive's way into a cube on the way to the star */
     float backward;       /* share of episodes that start on the demo, a little before the frontier */
@@ -446,6 +529,10 @@ struct Env {
     float last_x, last_z;
     uint32_t episode;     /* counts up from 1, to mark which cubes this episode has entered */
     uint32_t* entered;    /* the episode that last entered each cube */
+    uint32_t* cell_entered; /* the episode that last entered each archive cell */
+    int star_known;
+    float best_distance;  /* the closest he has been to the star this episode */
+    float progress_earned;
     float novelty_earned;
     float ghost_earned;
     int cells_entered;
@@ -519,6 +606,89 @@ static int sm64_star_spawning(SM64* env) {
     return (n64_s16(&env->gym, TIME_STOP_STATE) & TIME_STOP_MARIO_AND_DOORS) != 0;
 }
 
+/* --- the floor around him --------------------------------------------------------
+ *
+ * The game's own find_floor, over the course's fixed collision: the highest
+ * floor triangle under (x, z) whose surface is below y + 78 (the game's
+ * allowance for a step up). Returns its height, or -HUGE_VALF where there is
+ * none: off the side, where a fall goes to the death plane. Moving platforms
+ * and other objects' collision are not in it.
+ */
+static float sm64_floor_at(SM64* env, float x, float y, float z) {
+    N64Gym* gym = &env->gym;
+    int cx = (int)((x + 8192.0f) / PARTITION_CELL_SIZE);
+    int cz = (int)((z + 8192.0f) / PARTITION_CELL_SIZE);
+    if (x <= -8192.0f || z <= -8192.0f || cx >= PARTITION_CELLS || cz >= PARTITION_CELLS) {
+        return -HUGE_VALF;
+    }
+    uint32_t head = STATIC_SURFACE_PARTITION + (uint32_t)((cz * PARTITION_CELLS + cx) * 3 * 8);
+    uint32_t node = n64_u32(gym, head); /* the floors' list; its head is a node whose `next` is the first */
+    for (int guard = 0; n64_is_ram(node) && guard < 4096; guard++, node = n64_u32(gym, node)) {
+        uint32_t surface = n64_u32(gym, node + 4);
+        if (!n64_is_ram(surface)) {
+            continue;
+        }
+        float x1 = n64_s16(gym, surface + SURFACE_VERTEX1), z1 = n64_s16(gym, surface + SURFACE_VERTEX1 + 4);
+        float x2 = n64_s16(gym, surface + SURFACE_VERTEX1 + 6), z2 = n64_s16(gym, surface + SURFACE_VERTEX1 + 10);
+        float x3 = n64_s16(gym, surface + SURFACE_VERTEX1 + 12), z3 = n64_s16(gym, surface + SURFACE_VERTEX1 + 16);
+        if ((z1 - z) * (x2 - x1) - (x1 - x) * (z2 - z1) < 0.0f) continue;
+        if ((z2 - z) * (x3 - x2) - (x2 - x) * (z3 - z2) < 0.0f) continue;
+        if ((z3 - z) * (x1 - x3) - (x3 - x) * (z1 - z3) < 0.0f) continue;
+        float nx = n64_f32(gym, surface + SURFACE_NORMAL);
+        float ny = n64_f32(gym, surface + SURFACE_NORMAL + 4);
+        float nz = n64_f32(gym, surface + SURFACE_NORMAL + 8);
+        float offset = n64_f32(gym, surface + SURFACE_ORIGIN_OFFSET);
+        if (ny == 0.0f) continue;
+        float height = -(x * nx + nz * z + offset) / ny;
+        if (y - (height - 78.0f) < 0.0f) continue;
+        return height;
+    }
+    return -HUGE_VALF;
+}
+
+/* How far out the probes look, in units: a step, a jump, a long jump, and a
+ * second of sliding at full speed. */
+static const float sm64_probe_reach[PROBE_DISTANCES] = {150.0f, 400.0f, 900.0f, 2000.0f};
+
+/* The floor around him: for each probe, the floor's height there against his,
+ * signed and on a log scale (a step up is +0.3, the slide's 6,750-unit drop
+ * onto the lower track -3.3), and -6 where there is no floor at all. Looked
+ * for from 300 units above him, so a rise ahead is seen. */
+static void sm64_write_probes(SM64* env, float* out) {
+    float x = sm64_pos(env, 0), y = sm64_pos(env, 1), z = sm64_pos(env, 2);
+    int yaw = sm64_face_yaw(env);
+    for (int d = 0; d < PROBE_DIRECTIONS; d++) {
+        float angle = sm64_radians(yaw + d * (65536 / PROBE_DIRECTIONS));
+        /* yaw 0 faces +z and 0x4000 faces +x */
+        float sx = sinf(angle), sz = cosf(angle);
+        for (int r = 0; r < PROBE_DISTANCES; r++) {
+            float reach = sm64_probe_reach[r];
+            float floor = sm64_floor_at(env, x + sx * reach, y + 300.0f, z + sz * reach);
+            float rise = floor - y;
+            *out++ = floor == -HUGE_VALF ? -6.0f : copysignf(log1pf(fabsf(rise) / 250.0f), rise);
+        }
+    }
+}
+
+/* --- the star ----------------------------------------------------------------------
+ *
+ * Where it is comes from the config (star_x, star_y, star_z in the star's own
+ * stars/<star>.ini), because a star that spawns -- the slide's, at the bottom,
+ * only for a run inside 21 seconds -- is nowhere in memory until a run has
+ * already taken it. The first time a run takes a star the config does not
+ * place, where Mario touched it is printed, to put there.
+ */
+static float sm64_star_distance(SM64* env) {
+    float dx = env->star_x - sm64_pos(env, 0);
+    float dy = env->star_y - sm64_pos(env, 1);
+    float dz = env->star_z - sm64_pos(env, 2);
+    return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
+/* How far the star is from where the task starts: the whole of the way, which
+ * progress pays `progress` for. Measured once, from the savestate. */
+static float sm64_star_way;
+
 /* --- novelty ------------------------------------------------------------------
  *
  * Cubes over the whole of a level's space: x and z from -8192 to 8192, y from
@@ -549,11 +719,24 @@ static inline int sm64_cube(const SM64* env, float x, float y, float z) {
 
 /* --- the archive (Go-Explore) ------------------------------------------------
  *
- * For every cube, the shortest run of pad inputs from the savestate that has
+ * For every cell, the shortest run of pad inputs from the savestate that has
  * reached it. One archive for the process, like the visit counts, behind a
  * lock: the games reset and step in parallel. A run longer than
- * ARCHIVE_EPISODES episodes' worth of frames is not kept, so no reset replays
- * more than that: 2700 frames with 900-frame episodes.
+ * go_explore_frames episodes' worth of frames is not kept, so no reset replays
+ * more than that: 2700 frames with 900-frame episodes and the default 3.
+ *
+ * A cell is a cube and, with cell_speed and cell_heading set, how fast Mario
+ * is going there, which way he faces, and whether he is in the air. With
+ * cubes alone, two ways through the same place were one cell: the archive kept
+ * whichever got there first, so every run started from it went on the way
+ * that one did. On the slide, eight hours of runs all left the upper track
+ * with the same jump from the same spot, because a faster approach to that
+ * spot -- or the same spot taken in the air -- had nowhere to be kept. Now it
+ * is a cell of its own, with its own way in, and episodes start from it.
+ *
+ * Cells are numbered as they are first entered, through a hash table of their
+ * keys, so the archive's arrays are as long as the cells there are, not every
+ * cell there could be.
  */
 typedef struct SM64Input {
     uint16_t buttons;
@@ -567,12 +750,60 @@ typedef struct {
     int frames;
 } SM64Cell;
 
-#define ARCHIVE_EPISODES 3
+#define CELL_MAX (1 << 20)
+#define CELL_SLOTS (1 << 21)
+#define CELL_SPEEDS 8 /* buckets of speed past the last are the last */
 
-static SM64Cell sm64_archive[NOVELTY_CUBES];
-static int sm64_archive_cubes[NOVELTY_CUBES]; /* the cubes that have a run, in the order they got one */
+static uint64_t sm64_cell_keys[CELL_SLOTS]; /* a cell's key + 1, 0 for an empty slot */
+static int sm64_cell_ids[CELL_SLOTS];
+static int sm64_cell_count;
+static int sm64_cell_cube[CELL_MAX];        /* the cube each cell is in */
+static uint32_t sm64_cell_visits[CELL_MAX]; /* episodes that have entered each cell */
+static float sm64_cell_distance[CELL_MAX];  /* how far from the star each cell was first entered, with its place known */
+
+static SM64Cell sm64_archive[CELL_MAX];
+static int sm64_archive_cells[CELL_MAX]; /* the cells that have a run, in the order they got one */
 static int sm64_archive_size;
 static pthread_mutex_t sm64_archive_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* The cell Mario is in now, numbering it if it is new, or -1 outside the
+ * level's space or once CELL_MAX cells are numbered. */
+static int sm64_cell(SM64* env, int cube) {
+    if (cube < 0) {
+        return -1;
+    }
+    uint64_t key = (uint64_t)cube;
+    if (env->cell_speed > 0.0f) {
+        int speed = (int)(fabsf(sm64_forward_vel(env)) / env->cell_speed);
+        key |= (uint64_t)(speed < CELL_SPEEDS ? speed : CELL_SPEEDS - 1) << 20;
+        key |= (uint64_t)((sm64_action(env) & ACT_FLAG_AIR) != 0) << 24;
+    }
+    if (env->cell_heading > 1) {
+        key |= (uint64_t)((((unsigned)sm64_face_yaw(env) & 0xFFFF) * (unsigned)env->cell_heading) >> 16) << 25;
+    }
+    float distance = env->star_known ? sm64_star_distance(env) : 0.0f;
+    uint64_t slot = (key * 0x9E3779B97F4A7C15ull) >> 43; /* 21 bits */
+    int id = -1;
+    pthread_mutex_lock(&sm64_archive_lock);
+    for (;; slot = (slot + 1) & (CELL_SLOTS - 1)) {
+        if (sm64_cell_keys[slot] == key + 1) {
+            id = sm64_cell_ids[slot];
+            break;
+        }
+        if (sm64_cell_keys[slot] == 0) {
+            if (sm64_cell_count < CELL_MAX) {
+                id = sm64_cell_count++;
+                sm64_cell_keys[slot] = key + 1;
+                sm64_cell_ids[slot] = id;
+                sm64_cell_cube[id] = cube;
+                sm64_cell_distance[id] = distance;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&sm64_archive_lock);
+    return id;
+}
 
 static void sm64_trail_push(SM64* env, uint16_t buttons, int frames, float stick_x, float stick_y) {
     if (env->trail_count == env->trail_capacity) {
@@ -585,8 +816,24 @@ static void sm64_trail_push(SM64* env, uint16_t buttons, int frames, float stick
 
 static void sm64_watch_camera(SM64* env);
 
+/* Mark where Mario is as entered by episode `episode`, cube and cell. */
+static void sm64_mark(SM64* env, uint32_t episode) {
+    if (!sm64_in_the_world(env)) {
+        return;
+    }
+    int cube = sm64_cube(env, sm64_pos(env, 0), sm64_pos(env, 1), sm64_pos(env, 2));
+    if (cube < 0) {
+        return;
+    }
+    env->entered[cube] = episode;
+    int cell = sm64_cell(env, cube);
+    if (cell >= 0) {
+        env->cell_entered[cell] = episode;
+    }
+}
+
 /* Play the trail into the game, from the savestate: the start of an episode
- * that begins further on. The cubes it passes through count as this episode's,
+ * that begins further on. The cells it passes through count as this episode's,
  * so a star from here credits them too. (The episode number goes up once reset
  * is done, hence + 1.) They pay no novelty: the policy did not walk them. */
 static void sm64_replay_trail(SM64* env) {
@@ -607,85 +854,113 @@ static void sm64_replay_trail(SM64* env) {
             env->last_stick_angle = (int)lroundf(angle) & 0xFFFF;
             sm64_watch_camera(env);
         }
-        int passed = sm64_cube(env, sm64_pos(env, 0), sm64_pos(env, 1), sm64_pos(env, 2));
-        if (passed >= 0) {
-            env->entered[passed] = env->episode + 1;
-        }
+        sm64_mark(env, env->episode + 1);
     }
     n64gym_draw(&env->gym, N64B_GYM_DRAW_LAST_FRAME);
 }
 
-/* This episode has just reached a cube: keep how, if it is the first way or a shorter one. */
-static void sm64_archive_offer(SM64* env, int cube) {
-    if (env->trail_frames > ARCHIVE_EPISODES * env->max_ticks) {
+/* This episode has just reached a cell: keep how, if it is the first way or a shorter one. */
+static void sm64_archive_offer(SM64* env, int cell) {
+    if ((float)env->trail_frames > env->go_explore_frames * (float)env->max_ticks) {
         return;
     }
     pthread_mutex_lock(&sm64_archive_lock);
-    SM64Cell* cell = &sm64_archive[cube];
-    if (cell->inputs == NULL || env->trail_frames < cell->frames) {
+    SM64Cell* kept = &sm64_archive[cell];
+    if (kept->inputs == NULL || env->trail_frames < kept->frames) {
         SM64Input* inputs = (SM64Input*)malloc((size_t)env->trail_count * sizeof(SM64Input));
         memcpy(inputs, env->trail, (size_t)env->trail_count * sizeof(SM64Input));
-        if (cell->inputs == NULL) {
-            sm64_archive_cubes[sm64_archive_size++] = cube;
+        if (kept->inputs == NULL) {
+            sm64_archive_cells[sm64_archive_size++] = cell;
         }
-        free(cell->inputs);
-        cell->inputs = inputs;
-        cell->count = env->trail_count;
-        cell->frames = env->trail_frames;
+        free(kept->inputs);
+        kept->inputs = inputs;
+        kept->count = env->trail_count;
+        kept->frames = env->trail_frames;
     }
     pthread_mutex_unlock(&sm64_archive_lock);
 }
 
-/* Which cubes have been on the way to the star, and how many episodes have
+/* Which cells have been on the way to the star, and how many episodes have
  * started from each. Rarity alone was not enough: after 8M steps of starting
  * from the cubes fewest episodes had entered -- far corners of the moat and the
  * lake, mostly, when the goal was the castle door -- the door opened once in a
  * thousand, from either kind of start. So once an episode has taken the star,
- * every cube it passed through, the replayed part included, is credited, and a
- * go_explore_star share of archive starts are drawn from those cubes, least
+ * every cell it passed through, the replayed part included, is credited, and a
+ * go_explore_star share of archive starts are drawn from those cells, least
  * started-from first: all the way along some path to the star, from near the
- * start to the step before it. That is still only the reward speaking. Nothing
- * says where the star is. */
-static uint32_t sm64_cube_stars[NOVELTY_CUBES];
-static uint32_t sm64_cube_starts[NOVELTY_CUBES];
-static int sm64_star_cubes[NOVELTY_CUBES];
-static int sm64_star_cube_count;
+ * start to the step before it. */
+static uint32_t sm64_cell_stars[CELL_MAX];
+static uint32_t sm64_cell_starts[CELL_MAX];
+static int sm64_star_cells[CELL_MAX];
+static int sm64_star_cell_count;
+/* For each cube, the fewest frames from the savestate any way into it has
+ * taken that went on to the star, 0 for none: the ghost (below). */
+static int sm64_cube_ghost[NOVELTY_CUBES];
 
-/* Draw a cube from a list, each weighted 1 / sqrt(1 + its count). Call with the lock held. */
-static int sm64_draw(SM64* env, const int* cubes, int count, const uint32_t* counts) {
+/* Draw a cell from a list, each weighted 1 / sqrt(1 + its count). Call with the lock held. */
+static int sm64_draw(SM64* env, const int* cells, int count, const uint32_t* counts) {
     double total = 0.0;
     for (int k = 0; k < count; k++) {
-        total += 1.0 / sqrt(1.0 + (double)counts[cubes[k]]);
+        total += 1.0 / sqrt(1.0 + (double)counts[cells[k]]);
     }
     double pick = total * ((double)rand_r(&env->seed) / ((double)RAND_MAX + 1.0));
     for (int k = 0; k < count; k++) {
-        pick -= 1.0 / sqrt(1.0 + (double)counts[cubes[k]]);
+        pick -= 1.0 / sqrt(1.0 + (double)counts[cells[k]]);
         if (pick < 0.0) {
-            return cubes[k];
+            return cells[k];
         }
     }
-    return cubes[count - 1];
+    return cells[count - 1];
 }
 
-/* The episode has taken the star: credit every cube it was in. */
-static void sm64_credit_star(SM64* env, int star_cube) {
-    if (star_cube >= 0) {
-        env->entered[star_cube] = env->episode;
+/* The frontier, for a star whose place is known: a cell drawn from the ones
+ * within NEAR_REACH of the nearest the archive has been to the star, least
+ * started-from first. With cells as fine as speed and heading make them,
+ * drawing by rarity alone is drawing nearly evenly over everywhere any episode
+ * has been: the first slide run with them spent twenty minutes in 4,800 cubes
+ * of the course, its closest approaches getting further away, and never found
+ * the star. Call with the lock held. */
+#define NEAR_REACH 1500.0f
+#define NEAR_MOST 4096
+static int sm64_draw_near(SM64* env) {
+    float nearest = HUGE_VALF;
+    for (int k = 0; k < sm64_archive_size; k++) {
+        nearest = fminf(nearest, sm64_cell_distance[sm64_archive_cells[k]]);
     }
+    static int near[NEAR_MOST];
+    int count = 0;
+    for (int k = 0; k < sm64_archive_size && count < NEAR_MOST; k++) {
+        int cell = sm64_archive_cells[k];
+        if (sm64_cell_distance[cell] <= nearest + NEAR_REACH) {
+            near[count++] = cell;
+        }
+    }
+    return sm64_draw(env, near, count, sm64_cell_starts);
+}
+
+/* The episode has taken the star: credit every cell it was in. */
+static void sm64_credit_star(SM64* env) {
+    sm64_mark(env, env->episode);
+    int count = sm64_cell_count;
     pthread_mutex_lock(&sm64_archive_lock);
-    for (int cube = 0; cube < NOVELTY_CUBES; cube++) {
-        if (env->entered[cube] != env->episode || sm64_archive[cube].inputs == NULL) {
+    for (int cell = 0; cell < count; cell++) {
+        const SM64Cell* kept = &sm64_archive[cell];
+        if (env->cell_entered[cell] != env->episode || kept->inputs == NULL) {
             continue;
         }
-        if (sm64_cube_stars[cube]++ == 0) {
-            sm64_star_cubes[sm64_star_cube_count++] = cube;
+        if (sm64_cell_stars[cell]++ == 0) {
+            sm64_star_cells[sm64_star_cell_count++] = cell;
+        }
+        int* ghost = &sm64_cube_ghost[sm64_cell_cube[cell]];
+        if (*ghost == 0 || kept->frames < *ghost) {
+            *ghost = kept->frames;
         }
     }
     pthread_mutex_unlock(&sm64_archive_lock);
 }
 
-/* Start from a cube in the archive: copy its run onto this episode's trail and
- * replay it. The game is left where that run left it. Returns the cube, or -1
+/* Start from a cell in the archive: copy its run onto this episode's trail and
+ * replay it. The game is left where that run left it. Returns the cell, or -1
  * if the archive is empty. */
 static int sm64_archive_start(SM64* env) {
     pthread_mutex_lock(&sm64_archive_lock);
@@ -693,46 +968,48 @@ static int sm64_archive_start(SM64* env) {
         pthread_mutex_unlock(&sm64_archive_lock);
         return -1;
     }
-    int cube;
-    if (sm64_star_cube_count > 0 &&
+    int cell;
+    if (sm64_star_cell_count > 0 &&
         (double)rand_r(&env->seed) / ((double)RAND_MAX + 1.0) < env->go_explore_star) {
-        cube = sm64_draw(env, sm64_star_cubes, sm64_star_cube_count, sm64_cube_starts);
+        cell = sm64_draw(env, sm64_star_cells, sm64_star_cell_count, sm64_cell_starts);
+    } else if (env->star_known && (double)rand_r(&env->seed) / ((double)RAND_MAX + 1.0) < env->go_explore_near) {
+        cell = sm64_draw_near(env);
     } else {
-        cube = sm64_draw(env, sm64_archive_cubes, sm64_archive_size, sm64_cube_visits);
+        cell = sm64_draw(env, sm64_archive_cells, sm64_archive_size, sm64_cell_visits);
     }
-    sm64_cube_starts[cube]++;
-    SM64Cell* cell = &sm64_archive[cube];
+    sm64_cell_starts[cell]++;
+    const SM64Cell* kept = &sm64_archive[cell];
     env->trail_count = 0;
     env->trail_frames = 0;
-    for (int k = 0; k < cell->count; k++) {
-        const SM64Input* input = &cell->inputs[k];
+    for (int k = 0; k < kept->count; k++) {
+        const SM64Input* input = &kept->inputs[k];
         sm64_trail_push(env, input->buttons, input->frames, input->stick_x, input->stick_y);
     }
     pthread_mutex_unlock(&sm64_archive_lock);
     sm64_replay_trail(env);
-    return cube;
+    return cell;
 }
 
 /* --- the ghost ------------------------------------------------------------------
  *
  * The clock pays for speed only at the star, and little: thirty frames off a
  * 770-frame star is 0.02 of reward. What a run does get faster by is the
- * archive, which keeps the shortest way into every cube -- so the archive's way
- * into a cube is a ghost to race, as in a racing game, and beating it is paid
- * where it happens rather than 400 frames later.
+ * archive, which keeps the shortest way into every cell -- so the fastest way
+ * into a cube that went on to the star is a ghost to race, as in a racing
+ * game, and beating it is paid where it happens rather than 400 frames later.
  *
  * The first time in an episode Mario enters a cube that has been on the way to
- * the star, sooner than the archive's way into it, he is paid `ghost` a frame
- * of the difference, GHOST_MOST at most. The archive then keeps his way, so the
- * ghost is as fast as he was and doing the same again pays nothing: only a
- * faster run is ever paid, and a run fifty frames up on the ghost is paid at
- * every cube for as long as it stays ahead.
+ * the star, sooner than the ghost, he is paid `ghost` a frame of the
+ * difference, GHOST_MOST at most, and becomes the ghost. Doing the same again
+ * pays nothing: only a faster run is ever paid, and a run fifty frames up on
+ * the ghost is paid at every cube for as long as it stays ahead. The ghost is
+ * per cube, whatever cell -- speed, heading -- each way was in: it is the
+ * fastest way there, full stop.
  *
  * Only on the ground. A cube is 500 units high, so a jump that is going over
  * the side passes through the cubes of the track below it on the way, sooner
  * than anything that slid there; being first into a place he is about to fall
- * out of is not beating anything. (The archive keeps those ways all the same,
- * as it always has.)
+ * out of is not beating anything.
  */
 #define GHOST_MOST 0.1f
 
@@ -742,16 +1019,18 @@ static float sm64_ghost(SM64* env, int cube) {
     }
     float pay = 0.0f;
     pthread_mutex_lock(&sm64_archive_lock);
-    const SM64Cell* cell = &sm64_archive[cube];
-    if (sm64_cube_stars[cube] > 0 && cell->inputs != NULL && env->trail_frames < cell->frames) {
-        pay = fminf(env->ghost * (float)(cell->frames - env->trail_frames), GHOST_MOST);
+    int* ghost = &sm64_cube_ghost[cube];
+    if (*ghost > 0 && env->trail_frames < *ghost) {
+        pay = fminf(env->ghost * (float)(*ghost - env->trail_frames), GHOST_MOST);
+        *ghost = env->trail_frames;
     }
     pthread_mutex_unlock(&sm64_archive_lock);
     return pay;
 }
 
 /* Novelty's pay for being where Mario is now: something the first time this
- * episode he is in a cube, nothing after. */
+ * episode he is in a cube, nothing after. The archive is offered every cell
+ * the first time this episode he is in it. */
 static float sm64_novelty(SM64* env, float x, float y, float z) {
     /* A place is somewhere Mario could be. Falling out of the world is not: a
      * cube is novelty_cell units, so a fall through empty space enters a fresh
@@ -764,7 +1043,18 @@ static float sm64_novelty(SM64* env, float x, float y, float z) {
         return 0.0f;
     }
     int cube = sm64_cube(env, x, y, z);
-    if (cube < 0 || env->entered[cube] == env->episode) {
+    if (cube < 0) {
+        return 0.0f;
+    }
+    if (env->go_explore > 0.0f) {
+        int cell = sm64_cell(env, cube);
+        if (cell >= 0 && env->cell_entered[cell] != env->episode) {
+            env->cell_entered[cell] = env->episode;
+            __sync_add_and_fetch(&sm64_cell_visits[cell], 1);
+            sm64_archive_offer(env, cell);
+        }
+    }
+    if (env->entered[cube] == env->episode) {
         return 0.0f;
     }
     env->entered[cube] = env->episode;
@@ -773,11 +1063,7 @@ static float sm64_novelty(SM64* env, float x, float y, float z) {
     if (visits == 1) {
         __sync_add_and_fetch(&sm64_cubes_explored, 1);
     }
-    float ghost = 0.0f;
-    if (env->go_explore > 0.0f) {
-        ghost = sm64_ghost(env, cube); /* against the way on file, before his own replaces it */
-        sm64_archive_offer(env, cube);
-    }
+    float ghost = env->go_explore > 0.0f ? sm64_ghost(env, cube) : 0.0f;
     float bonus = env->novelty_episode + env->novelty / sqrtf((float)visits);
     env->novelty_earned += bonus;
     env->ghost_earned += ghost;
@@ -1467,14 +1753,15 @@ static int sm64_seed_from(SM64* env, const char* path) {
             break;
         }
         int cube = sm64_in_the_world(env) ? sm64_cube(env, sm64_pos(env, 0), sm64_pos(env, 1), sm64_pos(env, 2)) : -1;
-        if (cube < 0 || env->entered[cube] == env->episode) {
+        int cell = sm64_cell(env, cube);
+        if (cell < 0 || env->cell_entered[cell] == env->episode) {
             continue;
         }
-        env->entered[cube] = env->episode;
-        sm64_archive_offer(env, cube);
+        env->cell_entered[cell] = env->episode;
+        sm64_archive_offer(env, cell);
     }
     if (reached) {
-        sm64_credit_star(env, -1);
+        sm64_credit_star(env);
     } else {
         fprintf(stderr, "sm64: %s does not reach the star when played; its cubes are kept, not credited\n", path);
     }
@@ -1520,8 +1807,8 @@ static void sm64_archive_seed(SM64* env) {
             }
             closedir(dir);
         }
-        fprintf(stderr, "sm64: the archive starts with %d cubes, %d of them on the way to the star, from %d runs on file\n",
-                sm64_archive_size, sm64_star_cube_count, runs);
+        fprintf(stderr, "sm64: the archive starts with %d cells, %d of them on the way to the star, from %d runs on file\n",
+                sm64_archive_size, sm64_star_cell_count, runs);
         n64gym_draw(&env->gym, N64B_GYM_DRAW_LAST_FRAME);
         if (!n64gym_load_state(&env->gym, sm64_state_path())) {
             fprintf(stderr, "sm64: could not put the game back after seeding the archive: %s\n", env->gym.error);
@@ -1557,6 +1844,7 @@ void init(SM64* env) {
      * every frame from nothing, so the others are not drawn. */
     n64gym_draw(&env->gym, N64B_GYM_DRAW_LAST_FRAME);
     env->entered = (uint32_t*)calloc(NOVELTY_CUBES, sizeof(uint32_t));
+    env->cell_entered = (uint32_t*)calloc(CELL_MAX, sizeof(uint32_t));
     env->seed = 0x9E3779B9u ^ (env->rng * 2654435761u);
     env->mario = n64_u32(&env->gym, MARIO_STATE_PTR);
     sm64_use_goal(&env->goal);
@@ -1591,6 +1879,9 @@ void init(SM64* env) {
     }
     env->mario = n64_u32(&env->gym, MARIO_STATE_PTR);
     env->star_flags_at_start = sm64_star_flags(env);
+    if (env->star_known) {
+        sm64_star_way = sm64_star_distance(env);
+    }
     if (sm64_level(env) != env->goal.course->level || n64_s16(&env->gym, CURR_COURSE_NUM) != env->goal.course->course ||
         (env->goal.act > 0 && n64_s16(&env->gym, CURR_ACT_NUM) != env->goal.act)) {
         fprintf(stderr, "sm64: %s is level %d course %d act %d, where %s is level %d course %d act %d;"
@@ -1640,10 +1931,27 @@ static void sm64_write_picture(SM64* env, float* out) {
     }
 }
 
+static inline float sm64_clamp(float value, float low, float high) {
+    return value < low ? low : value > high ? high : value;
+}
+static inline float sm64_bit(uint32_t bits, int k) { return (bits >> k) & 1u ? 1.0f : 0.0f; }
+
+/* A surface's normal, turned into Mario's frame: x to his right, y up, z ahead.
+ * On a slide the floor's normal is which way is downhill from where he faces. */
+static void sm64_surface_normal(SM64* env, uint32_t surface, int yaw, float* out) {
+    float nx = n64_f32(&env->gym, surface + SURFACE_NORMAL);
+    float ny = n64_f32(&env->gym, surface + SURFACE_NORMAL + 4);
+    float nz = n64_f32(&env->gym, surface + SURFACE_NORMAL + 8);
+    float s = sinf(sm64_radians(yaw)), c = cosf(sm64_radians(yaw));
+    out[0] = nx * c - nz * s; /* right is (cos, -sin) in (x, z) */
+    out[1] = ny;
+    out[2] = nx * s + nz * c; /* ahead is (sin, cos) */
+}
+
 static void sm64_write_observations(SM64* env, float speed) {
     obs_t* obs = env->agents[0].observations;
     N64Gym* gym = &env->gym;
-    uint32_t action = sm64_action(env);
+    uint32_t m = env->mario;
 
     if (env->picture_width > 0) {
         sm64_write_picture(env, obs + NUM_OBS);
@@ -1656,9 +1964,10 @@ static void sm64_write_observations(SM64* env, float speed) {
     if (!env->state) {
         return;
     }
-    obs[OBS_POS_X] = sm64_pos(env, 0) / 4000.0f;
-    obs[OBS_POS_Y] = sm64_pos(env, 1) / 2000.0f;
-    obs[OBS_POS_Z] = sm64_pos(env, 2) / 4000.0f;
+    float x = sm64_pos(env, 0), y = sm64_pos(env, 1), z = sm64_pos(env, 2);
+    obs[OBS_POS_X] = x / 4000.0f;
+    obs[OBS_POS_Y] = y / 2000.0f;
+    obs[OBS_POS_Z] = z / 4000.0f;
     obs[OBS_VEL_X] = sm64_vel(env, 0) / 60.0f;
     obs[OBS_VEL_Y] = sm64_vel(env, 1) / 60.0f;
     obs[OBS_VEL_Z] = sm64_vel(env, 2) / 60.0f;
@@ -1668,39 +1977,90 @@ static void sm64_write_observations(SM64* env, float speed) {
     int yaw = sm64_face_yaw(env);
     obs[OBS_FACE_SIN] = sinf(sm64_radians(yaw));
     obs[OBS_FACE_COS] = cosf(sm64_radians(yaw));
-    obs[OBS_PITCH] = (float)n64_s16(gym, env->mario + M_FACE_ANGLE) / 32768.0f;
+    obs[OBS_PITCH] = (float)n64_s16(gym, m + M_FACE_ANGLE) / 32768.0f;
+    obs[OBS_ROLL] = (float)n64_s16(gym, m + M_FACE_ANGLE + 4) / 32768.0f;
+    for (int k = 0; k < 3; k++) {
+        obs[OBS_ANGLE_VEL_X + k] = sm64_clamp((float)n64_s16(gym, m + M_ANGLE_VEL + 2 * k) / 4096.0f, -4.0f, 4.0f);
+    }
+    int slide_yaw = n64_s16(gym, m + M_SLIDE_YAW) - yaw;
+    obs[OBS_SLIDE_YAW_SIN] = sinf(sm64_radians(slide_yaw));
+    obs[OBS_SLIDE_YAW_COS] = cosf(sm64_radians(slide_yaw));
+    obs[OBS_SLIDE_VEL_X] = sm64_clamp(n64_f32(gym, m + M_SLIDE_VEL_X) / 100.0f, -4.0f, 4.0f);
+    obs[OBS_SLIDE_VEL_Z] = sm64_clamp(n64_f32(gym, m + M_SLIDE_VEL_Z) / 100.0f, -4.0f, 4.0f);
+    int twirl = n64_s16(gym, m + M_TWIRL_YAW);
+    obs[OBS_TWIRL_YAW_SIN] = sinf(sm64_radians(twirl));
+    obs[OBS_TWIRL_YAW_COS] = cosf(sm64_radians(twirl));
+    obs[OBS_INTENDED_MAG] = n64_f32(gym, m + M_INTENDED_MAG) / 32.0f;
+    int intended = n64_s16(gym, m + M_INTENDED_YAW) - yaw;
+    obs[OBS_INTENDED_SIN] = sinf(sm64_radians(intended));
+    obs[OBS_INTENDED_COS] = cosf(sm64_radians(intended));
     /* Where the camera is, relative to the way he faces: the same number the
      * stick is aimed with, so the policy can see the lag in it. */
     obs[OBS_CAMERA_SIN] = sinf(sm64_radians(env->camera_offset - yaw));
     obs[OBS_CAMERA_COS] = cosf(sm64_radians(env->camera_offset - yaw));
 
-    float y = sm64_pos(env, 1);
-    float floor_height = n64_f32(gym, env->mario + M_FLOOR_HEIGHT);
-    float ceil_height = n64_f32(gym, env->mario + M_CEIL_HEIGHT);
-    obs[OBS_HEIGHT_ABOVE_FLOOR] = fminf((y - floor_height) / 500.0f, 4.0f);
-    uint32_t floor = n64_u32(gym, env->mario + M_FLOOR);
-    obs[OBS_FLOOR_SLOPE] = n64_is_ram(floor) ? n64_f32(gym, floor + SURFACE_NORMAL_Y) : 0.0f;
-    obs[OBS_HEADROOM] = fminf((ceil_height - y) / 1000.0f, 4.0f);
-    obs[OBS_TOUCHING_WALL] = n64_is_ram(n64_u32(gym, env->mario + M_WALL)) ? 1.0f : 0.0f;
-    obs[OBS_WATER] = fmaxf(fminf(((float)n64_s16(gym, env->mario + M_WATER_LEVEL) - y) / 500.0f,
-                                 2.0f), -2.0f);
-    obs[OBS_ON_GROUND] = (action & ACT_FLAG_AIR) ? 0.0f : 1.0f;
+    float floor_height = n64_f32(gym, m + M_FLOOR_HEIGHT);
+    obs[OBS_HEIGHT_ABOVE_FLOOR] = sm64_clamp((y - floor_height) / 500.0f, -4.0f, 4.0f);
+    obs[OBS_FLOOR_HEIGHT] = sm64_clamp(floor_height / 8192.0f, -2.0f, 2.0f);
+    obs[OBS_HEADROOM] = sm64_clamp((n64_f32(gym, m + M_CEIL_HEIGHT) - y) / 1000.0f, -4.0f, 4.0f);
+    uint32_t floor = n64_u32(gym, m + M_FLOOR);
+    if (n64_is_ram(floor)) {
+        obs[OBS_FLOOR] = 1.0f;
+        sm64_surface_normal(env, floor, yaw, &obs[OBS_FLOOR_NX]);
+        obs[OBS_FLOOR_TYPE] = (float)(n64_s16(gym, floor + SURFACE_TYPE) & 0xFF) / 64.0f;
+    }
+    int floor_angle = n64_s16(gym, m + M_FLOOR_ANGLE) - yaw;
+    obs[OBS_FLOOR_ANGLE_SIN] = sinf(sm64_radians(floor_angle));
+    obs[OBS_FLOOR_ANGLE_COS] = cosf(sm64_radians(floor_angle));
+    uint32_t wall = n64_u32(gym, m + M_WALL);
+    if (n64_is_ram(wall)) {
+        obs[OBS_WALL] = 1.0f;
+        sm64_surface_normal(env, wall, yaw, &obs[OBS_WALL_NX]);
+    }
+    obs[OBS_CEIL] = n64_is_ram(n64_u32(gym, m + M_CEIL)) ? 1.0f : 0.0f;
+    obs[OBS_WATER] = sm64_clamp(((float)n64_s16(gym, m + M_WATER_LEVEL) - y) / 500.0f, -2.0f, 2.0f);
+    obs[OBS_HEALTH] = (float)n64_s16(gym, m + M_HEALTH) / 2176.0f;
+    obs[OBS_PEAK_ABOVE] = sm64_clamp((n64_f32(gym, m + M_PEAK_HEIGHT) - y) / 1000.0f, -4.0f, 4.0f);
+    obs[OBS_FRAMES_SINCE_A] = (float)n64_u8(gym, m + M_FRAMES_SINCE_A) / 255.0f;
+    obs[OBS_FRAMES_SINCE_B] = (float)n64_u8(gym, m + M_FRAMES_SINCE_B) / 255.0f;
+    obs[OBS_WALL_KICK_TIMER] = (float)n64_u8(gym, m + M_WALL_KICK_TIMER) / 5.0f;
+    obs[OBS_DOUBLE_JUMP_TIMER] = (float)n64_u8(gym, m + M_DOUBLE_JUMP_TIMER) / 5.0f;
+    obs[OBS_INVINC_TIMER] = sm64_clamp((float)n64_s16(gym, m + M_INVINC_TIMER) / 60.0f, 0.0f, 4.0f);
+    obs[OBS_ACTION_TIMER] = sm64_clamp((float)n64_u16(gym, m + M_ACTION_TIMER) / 60.0f, 0.0f, 4.0f);
+    obs[OBS_ACTION_STATE] = sm64_clamp((float)n64_u16(gym, m + M_ACTION_STATE) / 8.0f, 0.0f, 4.0f);
+    obs[OBS_ACTION_ARG] = sm64_clamp((float)n64_u32(gym, m + M_ACTION_ARG) / 8.0f, 0.0f, 4.0f);
 
-    obs[OBS_GROUP_STATIONARY + ((action & ACT_GROUP_MASK) >> 6)] = 1.0f;
-    obs[OBS_ACTION_TIMER] = fminf((float)n64_u16(gym, env->mario + M_ACTION_TIMER) / 60.0f, 4.0f);
-    obs[OBS_ACTION_STATE] = fminf((float)n64_u16(gym, env->mario + M_ACTION_STATE) / 8.0f, 4.0f);
-    obs[OBS_HEALTH] = (float)n64_s16(gym, env->mario + M_HEALTH) / 2176.0f;
+    uint32_t action = sm64_action(env);
+    obs[OBS_ACTION_GROUP + ((action & ACT_GROUP_MASK) >> ACT_GROUP_SHIFT)] = 1.0f;
+    obs[OBS_ACTION_ID + (action & ACT_ID_MASK)] = 1.0f;
+    for (int k = 0; k < ACT_FLAGS; k++) {
+        obs[OBS_ACTION_FLAGS + k] = sm64_bit(action, ACT_FLAG_FIRST + k);
+    }
+    uint32_t prev = n64_u32(gym, m + M_PREV_ACTION);
+    obs[OBS_PREV_GROUP + ((prev & ACT_GROUP_MASK) >> ACT_GROUP_SHIFT)] = 1.0f;
+    obs[OBS_PREV_ID + (prev & ACT_ID_MASK)] = 1.0f;
+    uint32_t input = n64_u16(gym, m + M_INPUT);
+    uint32_t flags = n64_u32(gym, m + M_FLAGS);
+    for (int k = 0; k < 16; k++) {
+        obs[OBS_INPUT + k] = sm64_bit(input, k);
+        obs[OBS_MARIO_FLAGS + k] = sm64_bit(flags, k);
+    }
 
-    obs[OBS_FLAG_STATIONARY] = (action & ACT_FLAG_STATIONARY) ? 1.0f : 0.0f;
-    obs[OBS_FLAG_MOVING] = (action & ACT_FLAG_MOVING) ? 1.0f : 0.0f;
-    obs[OBS_FLAG_AIR] = (action & ACT_FLAG_AIR) ? 1.0f : 0.0f;
-    obs[OBS_FLAG_SWIMMING] = (action & (ACT_FLAG_SWIMMING | ACT_FLAG_METAL_WATER)) ? 1.0f : 0.0f;
-    obs[OBS_FLAG_SLIDING] = (action & ACT_FLAG_BUTT_OR_STOMACH_SLIDE) ? 1.0f : 0.0f;
-    obs[OBS_FLAG_DIVING] = (action & ACT_FLAG_DIVING) ? 1.0f : 0.0f;
-    obs[OBS_FLAG_POLE] = (action & ACT_FLAG_ON_POLE) ? 1.0f : 0.0f;
-    obs[OBS_FLAG_HANGING] = (action & ACT_FLAG_HANGING) ? 1.0f : 0.0f;
-    obs[OBS_FLAG_IDLE] = (action & ACT_FLAG_IDLE) ? 1.0f : 0.0f;
-    obs[OBS_FLAG_ATTACKING] = (action & ACT_FLAG_ATTACKING) ? 1.0f : 0.0f;
+    sm64_write_probes(env, &obs[OBS_PROBES]);
+
+    if (env->star_known) {
+        float dx = env->star_x - x, dy = env->star_y - y, dz = env->star_z - z;
+        obs[OBS_STAR_KNOWN] = 1.0f;
+        obs[OBS_STAR_DX] = sm64_clamp(dx / 8192.0f, -2.0f, 2.0f);
+        obs[OBS_STAR_DY] = sm64_clamp(dy / 8192.0f, -2.0f, 2.0f);
+        obs[OBS_STAR_DZ] = sm64_clamp(dz / 8192.0f, -2.0f, 2.0f);
+        obs[OBS_STAR_DISTANCE] = sm64_clamp(sqrtf(dx * dx + dy * dy + dz * dz) / 8192.0f, 0.0f, 4.0f);
+        /* The game's yaw 0 faces +z and 0x4000 faces +x, so atan2(dx, dz) is a yaw. */
+        float to_star = atan2f(dx, dz) - sm64_radians(yaw);
+        obs[OBS_STAR_SIN] = sinf(to_star);
+        obs[OBS_STAR_COS] = cosf(to_star);
+        obs[OBS_STAR_PROGRESS] = sm64_star_way > 0.0f ? 1.0f - env->best_distance / sm64_star_way : 0.0f;
+    }
 }
 
 /* Required function */
@@ -1758,6 +2118,8 @@ void puf_reset(SM64* env) {
     env->novelty_earned = 0.0f;
     env->ghost_earned = 0.0f;
     env->cells_entered = 0;
+    env->best_distance = env->star_known ? sm64_star_distance(env) : 0.0f;
+    env->progress_earned = 0.0f;
     sm64_write_observations(env, 0.0f);
 }
 
@@ -1788,6 +2150,33 @@ static void sm64_respawn(SM64* env) {
     env->last_z = sm64_pos(env, 2);
 }
 
+/* Progress: every time Mario gets closer to the star than he has been this
+ * episode, he is paid `progress` times the distance gained over the whole way
+ * from the start, so the way down is worth `progress` and a run that started
+ * further on is paid for what it covers. Only the closest approach counts, so
+ * going back and forth pays nothing, and only while there is floor under him,
+ * so a fall out of the world toward the star pays nothing either. It is a
+ * straight line: where the way winds away from the star for a while, nothing
+ * is paid and the archive carries the search, as it always has.
+ *
+ * And it is paid in a hurry: progress_hurry of it is lost as the clock runs,
+ * so the same ground covered sooner is worth more at every step of the way,
+ * not just at the star. */
+static float sm64_progress(SM64* env) {
+    if (!env->star_known || env->progress <= 0.0f || sm64_star_way <= 0.0f || !sm64_in_the_world(env)) {
+        return 0.0f;
+    }
+    float distance = sm64_star_distance(env);
+    if (distance >= env->best_distance) {
+        return 0.0f;
+    }
+    float hurry = 1.0f - env->progress_hurry * (float)env->tick / (float)env->max_ticks;
+    float pay = env->progress * (env->best_distance - distance) / sm64_star_way * fmaxf(hurry, 0.0f);
+    env->best_distance = distance;
+    env->progress_earned += pay;
+    return pay;
+}
+
 enum { ENDED_CLOCK, ENDED_STAR, ENDED_EARLY };
 
 static void sm64_end_episode(SM64* env, int how) {
@@ -1800,13 +2189,18 @@ static void sm64_end_episode(SM64* env, int how) {
     env->log.frames += star ? (float)env->tick : (float)env->max_ticks;
     env->log.novelty += env->novelty_earned;
     env->log.ghost += env->ghost_earned;
+    if (env->star_known) {
+        env->log.progress += sm64_star_way > 0.0f ? 1.0f - env->best_distance / sm64_star_way : 0.0f;
+        env->log.closest += env->best_distance;
+    }
+    env->log.progress_reward += env->progress_earned;
     env->log.cells += (float)env->cells_entered;
     env->log.explored += (float)sm64_cubes_explored;
     env->log.from_start += (float)env->from_start;
     env->log.start_perf += (float)(star && env->from_start);
     env->log.archive += (float)sm64_archive_size;
     env->log.replayed += (float)env->replayed_frames;
-    env->log.star_cubes += (float)sm64_star_cube_count;
+    env->log.star_cubes += (float)sm64_star_cell_count;
     env->log.frontier += (float)sm64_frontier;
     if (env->start_frontier >= 0) {
         sm64_demo_result(env, star);
@@ -1858,6 +2252,12 @@ void puf_step(SM64* env) {
     if (sm64_goal_reached(env)) {
         agent->rewards[0] = STAR_REWARD - step_cost;
         env->episode_return += agent->rewards[0];
+        static int told;
+        if (!env->star_known && !__sync_lock_test_and_set(&told, 1)) {
+            fprintf(stderr, "sm64: %s taken at (%.0f, %.0f, %.0f): star_x, star_y and star_z in"
+                            " envs/sm64/stars/%s.ini, to show the policy where it is and pay for getting nearer\n",
+                    env->goal.name, sm64_pos(env, 0), sm64_pos(env, 1), sm64_pos(env, 2), env->goal.name);
+        }
         sm64_fastest_offer(env);
         /* An exploring run offers its way to the demo, and so does a
          * robustifying one: a policy that gets there faster than the demo it
@@ -1868,7 +2268,7 @@ void puf_step(SM64* env) {
             sm64_demo_offer(env);
         }
         if (env->go_explore > 0.0f) {
-            sm64_credit_star(env, sm64_cube(env, sm64_pos(env, 0), sm64_pos(env, 1), sm64_pos(env, 2)));
+            sm64_credit_star(env);
         }
         sm64_end_episode(env, ENDED_STAR);
         return;
@@ -1922,7 +2322,7 @@ void puf_step(SM64* env) {
         env->top_speed = speed;
     }
 
-    agent->rewards[0] = -step_cost + sm64_novelty(env, x, sm64_pos(env, 1), z);
+    agent->rewards[0] = -step_cost + sm64_novelty(env, x, sm64_pos(env, 1), z) + sm64_progress(env);
     env->episode_return += agent->rewards[0];
 
     if (env->tick >= env->max_ticks) {
@@ -1961,9 +2361,11 @@ void puf_close(SM64* env) {
         env->opened = 0;
     }
     free(env->entered);
+    free(env->cell_entered);
     free(env->trail);
     env->trail = NULL;
     env->entered = NULL;
+    env->cell_entered = NULL;
 }
 
 /* Required function: read this env's settings from [env] in its config, and start its game */
@@ -1982,9 +2384,19 @@ void puf_init(Env* env, Dict* kwargs) {
     env->novelty = (float)dict_get(kwargs, "novelty");
     env->novelty_episode = (float)dict_get(kwargs, "novelty_episode");
     env->novelty_cell = (float)dict_get(kwargs, "novelty_cell");
+    env->cell_speed = (float)dict_get(kwargs, "cell_speed");
+    env->cell_heading = (int)dict_get(kwargs, "cell_heading");
+    env->star_x = (float)dict_get(kwargs, "star_x");
+    env->star_y = (float)dict_get(kwargs, "star_y");
+    env->star_z = (float)dict_get(kwargs, "star_z");
+    env->star_known = env->star_x != 0.0f || env->star_y != 0.0f || env->star_z != 0.0f;
+    env->progress = (float)dict_get(kwargs, "progress");
+    env->progress_hurry = (float)dict_get(kwargs, "progress_hurry");
     env->respawn = (int)dict_get(kwargs, "respawn");
     env->go_explore = (float)dict_get(kwargs, "go_explore");
     env->go_explore_star = (float)dict_get(kwargs, "go_explore_star");
+    env->go_explore_near = (float)dict_get(kwargs, "go_explore_near");
+    env->go_explore_frames = (float)dict_get(kwargs, "go_explore_frames");
     env->go_explore_seed = (int)dict_get(kwargs, "go_explore_seed");
     env->ghost = (float)dict_get(kwargs, "ghost");
     env->backward = (float)dict_get(kwargs, "backward");
@@ -2008,6 +2420,9 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "frames", log->frames);
     dict_set(out, "novelty", log->novelty);
     dict_set(out, "ghost", log->ghost);
+    dict_set(out, "progress", log->progress);
+    dict_set(out, "closest", log->closest);
+    dict_set(out, "progress_reward", log->progress_reward);
     dict_set(out, "cells", log->cells);
     dict_set(out, "explored", log->explored);
     dict_set(out, "from_start", log->from_start);

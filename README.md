@@ -1,4 +1,4 @@
-# rl
+# puff-rs
 
 Reinforcement learning experiments on [PufferLib](https://github.com/PufferAI/PufferLib) 5.0, in Rust and C, including an agent that speedruns a star in the real Super Mario 64.
 
@@ -184,18 +184,21 @@ Which star counts is its own bit in the save file's star flags. Any other star i
 ### Actions and observations
 
 - **Actions:** four discrete heads. A stick direction, which is none or one of sixteen *relative to the way Mario is facing*, and A, B and Z held or not. The game adds the camera's yaw to the stick, so a policy pushing pad-relative "up" would run wherever the camera drifted. The env measures that offset each frame and corrects for it.
-- **Observations:** 40 floats read out of memory. They cover position, velocity, facing, the camera relative to it, height above the floor, the floor's slope, headroom, wall, water and air flags, his action's group and flags, health, and the clock. Nothing says where the star is.
-- **The picture** (optional). `picture_width` and `picture_height` append the game's frame, shrunk to that size, from the console's video interface. `state = 0` zeroes the 40 numbers except the clock. Drawing costs half to three quarters of the throughput. `make sm64-picture` trains with an 80×60 one.
+- **Observations:** 290 floats. Everything about Mario that can be read out of memory: position, velocity, facing, spin, slide velocity, the stick as the game read it, the camera, the floor, wall and ceiling (their normals turned into his frame), his action and the one before (one-hot), timers, input and Mario flags, health.
+- **Floor probes:** the height of the floor at 8 directions round him and 4 distances (150 to 2,000 units), found by walking the course's collision in RAM the way the game's own `find_floor` does. `SM64_TRACE_FLOORS=1` checks them against the game during a replay. They match it to a tenth of a unit, and they see the slide's 6,750-unit drop before the jump.
+- **The star:** with `star_x`, `star_y`, `star_z` set (in `stars/<star>.ini`), its offset, distance and direction relative to his facing. A star with no place set prints where Mario touched it the first time a run takes it.
+- **The picture** (optional). `picture_width` and `picture_height` append the game's frame, shrunk to that size, from the console's video interface. `state = 0` zeroes the numbers except the clock. Drawing costs half to three quarters of the throughput. `make sm64-picture` trains with an 80×60 one.
 - One agent step is two frames (`frameskip`), so fifteen decisions a second.
 
 ### The reward
 
 - **The star** pays 1 and ends the episode.
 - **The clock.** Every frame costs `time_penalty / max_ticks`, so sooner is better, and running out of time costs `time_penalty` in all.
+- **Progress** (with the star's place set). Each new closest approach to the star pays `progress` times the distance gained over the whole way from the start. With `progress_hurry`, the pay shrinks as the clock runs, so the same ground covered sooner pays more.
 - **Novelty.** The course is cut into cubes 500 units a side. The first time in an episode Mario enters one, he's paid `novelty_episode + novelty / sqrt(n)`, where `n` counts the episodes that have entered it. A cube with no floor under him isn't a place and pays nothing.
 - **Deaths and warps** out of the course charge whatever is left of the clock at once, so dying is never a way to stop it early. With `respawn = 1` a death puts the game back at the savestate and the episode carries on with the clock where it was.
 
-Nothing pays for getting nearer the star. The policy learns about the star by taking it.
+Without a place for the star, nothing pays for getting nearer it, and the policy learns about the star by taking it.
 
 In the log, `perf` is the fraction of episodes that take the star, and `frames` is what's being minimized. Both include episodes that began partway there, from the archive. `start_perf / from_start` is the star rate from the real start, which is the one that counts.
 
@@ -203,7 +206,10 @@ In the log, `perf` is the fraction of episodes that take the star, and `frames` 
 
 Novelty alone wasn't enough, so the env also runs [Go-Explore](https://arxiv.org/abs/1901.10995).
 
-- **The archive.** For every cube any episode has entered, it keeps the shortest run of pad inputs that reached it. The game is deterministic, so the inputs *are* the place, at a few kilobytes against a savestate's 8 MB. A `go_explore` share of episodes pick a cube, weighted toward rarely visited ones (and with `go_explore_star`, toward cubes on a way to the star), replay its inputs, and only then start the clock.
+- **The archive.** For every cell any episode has entered, it keeps the shortest run of pad inputs that reached it. The game is deterministic, so the inputs *are* the place, at a few kilobytes against a savestate's 8 MB. A `go_explore` share of episodes pick a cell, weighted toward rarely visited ones (and with `go_explore_star`, toward cells on a way to the star), replay its inputs, and only then start the clock.
+- **Cells** are a 500-unit cube plus, with `cell_speed` and `cell_heading`, a speed bucket, airborne or not, and one of eight headings. That way two ways through one place are kept apart.
+- **The frontier** (`go_explore_near`, with the star's place set). This share of starts comes from the archive cells within 1,500 units of the nearest any episode has been to the star.
+- **`go_explore_frames`** is the longest way the archive keeps, in episodes' worth of frames. The default is 3; for a speedrun it's 1, since a place reached later than the clock allows isn't on any run inside it.
 - **Seeding** (`go_explore_seed = 1`). The archive starts with the runs on file instead of empty, so what separate runs found can meet.
 - **The ghost** (`ghost`). Entering a cube on a way to the star sooner than the archive's way into it, on the ground, pays per frame of the difference. The archive then keeps the new way, so only a faster run is ever paid.
 - **Phase 1 without a policy.** `make sm64-explore` plays at random from the archive and keeps the fastest run to the star.
@@ -218,6 +224,7 @@ Every target takes `STAR=<star>` and passes `ARGS` through.
 | `make sm64-train` | train on the star, the clock and novelty, with the archive |
 | `make sm64-explore` | Go-Explore phase 1 with no policy (`GAMES=8 SECONDS=600`) |
 | `make sm64-robustify` | Go-Explore phase 2, working back along the fastest run on file |
+| `make sm64-speedrun` | everything at once for the fastest run: fine cells, the frontier, the ghost, progress, a capped archive |
 | `make sm64-picture` | train with an 80×60 picture of the game in the observation |
 | `make sm64-watch` | watch the star's most trained checkpoint, in a window, from the real start |
 | `make sm64-replay` | watch the fastest run on file |
@@ -277,7 +284,13 @@ The spawn comes about a hundred frames of cutscene before the touch, so the 648 
 
 **What's unsolved.** No policy has ever taken the star from the top of the slide in one episode. Every record is a run the archive assembled from starts partway down. Robustifying learns the last few seconds of a demo and then stalls, because the ending only works from the state the demo arrived in. And because `pss-2` pays nothing unless the slide is already fast, an episode from the top has no reward to learn from.
 
-**What's next.** The archive keys a cube by position alone, so two different ways through the same place can't both be kept, and recent runs all jump and land at the same points. A finer key (speed, heading) is the likely next move. [`demos/peach-slide/README.md`](demos/peach-slide/README.md) describes each record run, and [`NEXT.md`](demos/peach-slide/NEXT.md) beside it has the exact command for the next run and where the remaining frames probably are.
+**From a blank slate, with everything (2026-10-14).** `make sm64-speedrun STAR=pss-2` ran for an hour: 10.2M steps, no demos or seeds, with the 290-number observation, floor probes, the star's place, progress in a hurry, speed and heading in the archive's cells, the frontier and the ghost. **It took no star.** The nearest single episodes got within 350 to 500 units of the star's spot, but not inside 21 seconds, so nothing spawned. Three things went wrong, in order:
+
+1. Cells as fine as speed and heading make the archive 20 to 26 thousand cells. Drawing starts by rarity then draws almost evenly over the whole course. The first attempt spent 20 minutes all over it, and its closest approaches got further away. The frontier (`go_explore_near`) fixed that: the average closest approach went from 7,800 units to 1,700 within five minutes.
+2. The ways to the bottom it kept ran to 2,700 frames, far outside the 21 seconds the star wants, and replaying them halved the steps a second. Hence `go_explore_frames`.
+3. With both fixes, the policy learned to be careful, not fast. Top speed fell from 95 units a frame to 45 to 50 over the hour, and deaths an episode from 1.6 to 0.4. With `respawn` on, a fall gives up whatever progress the rest of the episode would have paid, so slowing down to stay on the track is what that reward pays for. On `pss-2`, careful means no star.
+
+What would most likely change it: pay progress only inside the time the star allows, or make the clock and the hurry bigger than what a fall costs; or seed the archive with one run to the star (`go_explore_seed`), so the ghost has something to race from the first minute. The archive's cells, the frontier and the star's place all carry over to other stars as they are. [`demos/peach-slide/README.md`](demos/peach-slide/README.md) describes each record run, and [`NEXT.md`](demos/peach-slide/NEXT.md) beside it has the command the records were made with. [`demos/peach-slide/README.md`](demos/peach-slide/README.md) describes each record run, and [`NEXT.md`](demos/peach-slide/NEXT.md) beside it has the exact command for the next run and where the remaining frames probably are.
 
 ## Findings worth keeping
 

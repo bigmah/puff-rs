@@ -371,6 +371,19 @@ static int replay(int window, const char* path) {
             printf("  frame %4d  pos (%8.1f %7.1f %8.1f)  fwd %7.2f  action %08x%s%s\n", frame, sm64_pos(env, 0),
                    sm64_pos(env, 1), sm64_pos(env, 2), sm64_forward_vel(env), action,
                    (action & ACT_FLAG_AIR) ? "  (in the air)" : "", sm64_in_the_world(env) ? "" : "  (no floor)");
+            /* SM64_TRACE_FLOORS=1 also checks the floor probes against the game:
+             * the floor the probes find under Mario and the one the game keeps,
+             * then what the probes see ahead of him. */
+            if (atoi(sm64_setting("SM64_TRACE_FLOORS", "0"))) {
+                float probes[PROBES];
+                sm64_write_probes(env, probes);
+                printf("              floor %8.1f, found %8.1f; ahead", n64_f32(&env->gym, env->mario + M_FLOOR_HEIGHT),
+                       sm64_floor_at(env, sm64_pos(env, 0), sm64_pos(env, 1), sm64_pos(env, 2)));
+                for (int r = 0; r < PROBE_DISTANCES; r++) {
+                    printf(" %5.2f", probes[r]);
+                }
+                printf("\n");
+            }
         }
         puf_render(env);
         /* In a window it is being watched, so it is played at the speed a

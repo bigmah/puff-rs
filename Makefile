@@ -1,4 +1,4 @@
-.PHONY: setup trainer test bench build play train eval sm64 sm64-state sm64-train sm64-explore sm64-robustify sm64-picture sm64-watch sm64-replay sm64-demo sm64-bench
+.PHONY: setup trainer test bench build play train eval sm64 sm64-state sm64-train sm64-explore sm64-robustify sm64-speedrun sm64-picture sm64-watch sm64-replay sm64-demo sm64-bench
 
 # Which env to build and train. Each builds into a library of its own
 # (build/vecenv_<env>.dylib, or .so), so building one leaves the others as they are.
@@ -90,6 +90,18 @@ sm64-robustify: sm64
 		--env.novelty 0 --env.novelty-episode 0 \
 		--train.target-entropy 0 --train.ent-coef 0.005 --train.learning-rate 0.005 \
 		--train.norm-adv 1 --train.gamma 0.999 --train.gae-lambda 0.95 --train.minibatch-size 1024 $(ARGS)
+
+# Everything at once, for the fastest run to the star: Go-Explore with cells
+# that tell speed and heading apart, most episodes started from the archive and
+# most of those along the way to the star (or, before there is one, nearest
+# it), no way kept that is longer than the clock, the ghost to race, and --
+# with the star's place in its stars/$(STAR).ini -- progress paid in a hurry. The fastest
+# runs land in build/sm64/$(STAR)/fastest/ as they are found. Advantages are
+# normalized and entropy is held with damping: see NEXT.md in demos/peach-slide.
+sm64-speedrun: sm64
+	$(PUFFERL) train sm64 $(STAR_RUN) --env.go-explore 0.75 --env.go-explore-star 0.75 --env.go-explore-frames 1 --env.ghost 0.02 \
+		--train.norm-adv 1 --train.learning-rate 0.005 --train.ent-coef 0.007 --train.ent-coef-rate 0.0025 \
+		--train.ent-coef-damping 0.5 $(ARGS)
 
 # Train with the policy looking at the game: an 80 by 60 picture of it in the
 # observation, through a small convolutional net. About a quarter of the speed.

@@ -1,5 +1,5 @@
 [package]
-name = "pufferl"
+name = "puff-rs"
 version = "0.1.0"
 edition = "2021"
 description = "PufferLib 5.0's trainer on wgpu: Metal, Vulkan and DX12 from one program"
