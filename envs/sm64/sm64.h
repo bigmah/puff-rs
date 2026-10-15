@@ -468,6 +468,9 @@ struct Log {
     float cells;           /* cubes entered this episode */
     float explored;        /* cubes any game has ever entered, as of the end of this episode */
     float from_start;      /* fraction of episodes that began where the task does, not from the archive */
+    float reach;           /* the least way left to the star, along the steps taken, of any place the archive reaches inside max_ticks */
+    float pace;            /* the best pace in the archive: share of the clock spent plus share of the way left */
+    float racing;          /* fraction held to the star's clock: from the start, or the frontier */
     float start_perf;      /* fraction that began there and took the star: the star rate is start_perf / from_start */
     float archive;         /* cells in the archive */
     float replayed;        /* frames replayed to reach the episode's starting cube, 0 from the real start */
@@ -495,7 +498,8 @@ struct Env {
 
     SM64Goal goal;        /* which star: `star` and `act` in [env] */
     int frameskip;        /* frames of the game per agent step */
-    int max_ticks;        /* frames of the game per episode */
+    int max_ticks;        /* frames of the game per episode: for a star with a time limit, that limit */
+    int explore_ticks;    /* the clock of an episode that explores from the archive, 0 for max_ticks */
     int random_start;     /* frames of random stick held after loading the state */
     float time_penalty;   /* reward the whole clock costs, spent a frame at a time */
     float novelty;        /* reward for entering a cube no episode has entered before, fading as 1 / sqrt(episodes) */
@@ -510,7 +514,10 @@ struct Env {
     float go_explore;     /* share of episodes that start from a cube in the archive */
     float go_explore_star; /* share of those that start from a cube on the way to the star, once there is one */
     float go_explore_frames; /* the longest way the archive keeps, in episodes' worth of frames */
-    float go_explore_near; /* share of the rest that start from the cells nearest the star, with its place known */
+    float go_explore_near; /* share of the rest that start from the cells most on pace for the star, with its place known */
+    int progress_way;      /* progress pays for the way left along the steps taken, not as the crow flies */
+    int frontier_way;      /* the frontier's way left is along the steps taken, not as the crow flies */
+    int go_explore_clock;  /* a racing archive start begins with the clock at the frames it replayed, not at 0 */
     int go_explore_seed;  /* start the archive with the runs on file rather than with nothing */
     float ghost;          /* reward per frame sooner than the archive's way into a cube on the way to the star */
     float backward;       /* share of episodes that start on the demo, a little before the frontier */
@@ -532,6 +539,7 @@ struct Env {
     uint32_t* cell_entered; /* the episode that last entered each archive cell */
     int star_known;
     float best_distance;  /* the closest he has been to the star this episode */
+    float best_way;       /* the least way left he has had this episode, with progress_way */
     float progress_earned;
     float novelty_earned;
     float ghost_earned;
@@ -539,6 +547,9 @@ struct Env {
     struct SM64Input* trail; /* every pad input since the savestate, replayed ones first */
     int trail_count, trail_capacity, trail_frames;
     int from_start;
+    int last_cube;        /* the cube of the last step, for the way along; -1 after a jump in place */
+    int racing;           /* this episode is held to max_ticks; with explore_ticks set, archive starts off the frontier are not */
+    int clock;            /* the frames this episode's clock runs to: max_ticks, or explore_ticks */
     int start_cube;       /* the archive cube this episode began in, or -1 */
     int start_frontier;   /* the frontier this episode began at on the demo, or -1 */
     int replayed_frames;
@@ -691,15 +702,16 @@ static float sm64_star_way;
 
 /* --- novelty ------------------------------------------------------------------
  *
- * Cubes over the whole of a level's space: x and z from -8192 to 8192, y from
- * -4096 to 8192. The visit counts are one table for the process, because the
+ * Cubes over the whole of a level's space, -8192 to 8192 every way. Down to
+ * -4096 only, as it was, left out the bottom of Peach's slide, star and all
+ * (the star is at -4300): the archive never kept a place there. The visit counts are one table for the process, because the
  * games stepping in parallel are exploring the same course, and a cube one of
  * them has worn out is not new to the others. Increments race between threads,
  * so they are atomic.
  */
 #define NOVELTY_MIN_CELL 250.0f
 #define NOVELTY_MAX_XZ 66 /* 16384 / NOVELTY_MIN_CELL, rounded up */
-#define NOVELTY_MAX_Y 50  /* 12288 / NOVELTY_MIN_CELL, rounded up */
+#define NOVELTY_MAX_Y 66  /* 16384 / NOVELTY_MIN_CELL, rounded up */
 #define NOVELTY_CUBES (NOVELTY_MAX_XZ * NOVELTY_MAX_XZ * NOVELTY_MAX_Y)
 
 static uint32_t sm64_cube_visits[NOVELTY_CUBES];
@@ -709,7 +721,7 @@ static uint32_t sm64_cubes_explored;
 static inline int sm64_cube(const SM64* env, float x, float y, float z) {
     float side = fmaxf(env->novelty_cell, NOVELTY_MIN_CELL);
     int i = (int)floorf((x + 8192.0f) / side);
-    int j = (int)floorf((y + 4096.0f) / side);
+    int j = (int)floorf((y + 8192.0f) / side);
     int k = (int)floorf((z + 8192.0f) / side);
     if (i < 0 || j < 0 || k < 0 || i >= NOVELTY_MAX_XZ || k >= NOVELTY_MAX_XZ || j >= NOVELTY_MAX_Y) {
         return -1;
@@ -861,7 +873,8 @@ static void sm64_replay_trail(SM64* env) {
 
 /* This episode has just reached a cell: keep how, if it is the first way or a shorter one. */
 static void sm64_archive_offer(SM64* env, int cell) {
-    if ((float)env->trail_frames > env->go_explore_frames * (float)env->max_ticks) {
+    int clock = env->explore_ticks > env->max_ticks ? env->explore_ticks : env->max_ticks;
+    if ((float)env->trail_frames > env->go_explore_frames * (float)clock) {
         return;
     }
     pthread_mutex_lock(&sm64_archive_lock);
@@ -913,25 +926,220 @@ static int sm64_draw(SM64* env, const int* cells, int count, const uint32_t* cou
     return cells[count - 1];
 }
 
-/* The frontier, for a star whose place is known: a cell drawn from the ones
- * within NEAR_REACH of the nearest the archive has been to the star, least
- * started-from first. With cells as fine as speed and heading make them,
- * drawing by rarity alone is drawing nearly evenly over everywhere any episode
- * has been: the first slide run with them spent twenty minutes in 4,800 cubes
- * of the course, its closest approaches getting further away, and never found
- * the star. Call with the lock held. */
-#define NEAR_REACH 1500.0f
-#define NEAR_MOST 4096
-static int sm64_draw_near(SM64* env) {
-    float nearest = HUGE_VALF;
+/* --- the way along ------------------------------------------------------------
+ *
+ * How far a place is from the star along the ways episodes have gone, not as
+ * the crow flies. Every step from one cube into a neighbouring one is kept, as
+ * a bit for that neighbour; from the cube nearest the star any episode has
+ * been, the shortest way back through those steps gives every cube that leads
+ * there its way left. A cube nothing has gone on from toward it has none.
+ *
+ * As the crow flies is wrong on any course that winds. On the slide, the 674
+ * run gets no nearer the star from frame 240 to 450: the lower track runs away
+ * from it, and the 6,000-unit drop onto it changes the distance by nothing.
+ * Ranked by straight distance, every place on the lower track was behind the
+ * upper one, and the frontier never went there.
+ *
+ * The steps are between cubes a step apart in all three directions -- a step
+ * is frameskip frames, under 250 units on the slide -- and a respawn or a fall
+ * out of the world is not a step. Recomputed every WAY_EVERY starts from the
+ * archive, under the archive's lock. */
+#define WAY_EVERY 256
+#define WAY_HEAP (1 << 20)
+static uint32_t sm64_cube_steps[NOVELTY_CUBES]; /* bit n: an episode has stepped from here to neighbour n */
+static float sm64_cube_way[NOVELTY_CUBES];      /* the way left to the star along steps taken, HUGE_VALF for none */
+static float sm64_way_start;                    /* the way left from the start, or the longest there is without one */
+static int sm64_start_cube = -1;                /* the cube the savestate puts Mario in */
+static float sm64_way_reach;                    /* the least way left of any cell the archive reaches inside max_ticks */
+static float sm64_way_pace;                     /* the best pace of any cell, by the way left */
+static int sm64_way_updates;
+
+static inline int sm64_neighbour(int from, int to, int* n) {
+    int fi = from % NOVELTY_MAX_XZ, fk = (from / NOVELTY_MAX_XZ) % NOVELTY_MAX_XZ, fj = from / (NOVELTY_MAX_XZ * NOVELTY_MAX_XZ);
+    int ti = to % NOVELTY_MAX_XZ, tk = (to / NOVELTY_MAX_XZ) % NOVELTY_MAX_XZ, tj = to / (NOVELTY_MAX_XZ * NOVELTY_MAX_XZ);
+    int di = ti - fi, dj = tj - fj, dk = tk - fk;
+    if (di < -1 || di > 1 || dj < -1 || dj > 1 || dk < -1 || dk > 1) {
+        return 0;
+    }
+    *n = (di + 1) * 9 + (dj + 1) * 3 + (dk + 1);
+    return 1;
+}
+
+/* An episode has gone from cube `from` straight into cube `to`. */
+static void sm64_step_taken(int from, int to) {
+    int n;
+    if (from >= 0 && to >= 0 && from != to && sm64_neighbour(from, to, &n) && !(sm64_cube_steps[from] & (1u << n))) {
+        __sync_fetch_and_or(&sm64_cube_steps[from], 1u << n);
+    }
+}
+
+static void sm64_cube_centre(const SM64* env, int cube, float* x, float* y, float* z) {
+    float side = fmaxf(env->novelty_cell, NOVELTY_MIN_CELL);
+    *x = ((float)(cube % NOVELTY_MAX_XZ) + 0.5f) * side - 8192.0f;
+    *z = ((float)((cube / NOVELTY_MAX_XZ) % NOVELTY_MAX_XZ) + 0.5f) * side - 8192.0f;
+    *y = ((float)(cube / (NOVELTY_MAX_XZ * NOVELTY_MAX_XZ)) + 0.5f) * side - 8192.0f;
+}
+
+static float sm64_pace(const SM64* env, int cell);
+
+/* Work out the way left for every cube, from scratch. Call with the lock held. */
+static void sm64_way_update(SM64* env) {
+    static float heap_key[WAY_HEAP];
+    static int heap_cube[WAY_HEAP];
+    float side = fmaxf(env->novelty_cell, NOVELTY_MIN_CELL);
+    int target = -1;
+    float target_way = HUGE_VALF;
+    for (int c = 0; c < NOVELTY_CUBES; c++) {
+        sm64_cube_way[c] = HUGE_VALF;
+        if (sm64_cube_visits[c] > 0) {
+            float x, y, z;
+            sm64_cube_centre(env, c, &x, &y, &z);
+            float d = sqrtf((x - env->star_x) * (x - env->star_x) + (y - env->star_y) * (y - env->star_y) +
+                            (z - env->star_z) * (z - env->star_z));
+            if (d < target_way) {
+                target_way = d;
+                target = c;
+            }
+        }
+    }
+    if (target < 0) {
+        return;
+    }
+    /* Dijkstra, backwards along the steps: a cube's way left is the least, over
+     * the steps out of it, of the step's length and the way left after it. */
+    int size = 0;
+    sm64_cube_way[target] = target_way;
+    heap_key[0] = target_way;
+    heap_cube[0] = target;
+    size = 1;
+    while (size > 0) {
+        float key = heap_key[0];
+        int cube = heap_cube[0];
+        size--;
+        float last_key = heap_key[size];
+        int last_cube = heap_cube[size];
+        int at = 0;
+        for (;;) {
+            int child = 2 * at + 1;
+            if (child >= size) break;
+            if (child + 1 < size && heap_key[child + 1] < heap_key[child]) child++;
+            if (heap_key[child] >= last_key) break;
+            heap_key[at] = heap_key[child];
+            heap_cube[at] = heap_cube[child];
+            at = child;
+        }
+        heap_key[at] = last_key;
+        heap_cube[at] = last_cube;
+        if (key > sm64_cube_way[cube]) {
+            continue;
+        }
+        int ci = cube % NOVELTY_MAX_XZ, ck = (cube / NOVELTY_MAX_XZ) % NOVELTY_MAX_XZ, cj = cube / (NOVELTY_MAX_XZ * NOVELTY_MAX_XZ);
+        for (int di = -1; di <= 1; di++)
+        for (int dj = -1; dj <= 1; dj++)
+        for (int dk = -1; dk <= 1; dk++) {
+            int pi = ci - di, pj = cj - dj, pk = ck - dk; /* the cube a step (di, dj, dk) comes from */
+            if ((di | dj | dk) == 0 || pi < 0 || pk < 0 || pj < 0 || pi >= NOVELTY_MAX_XZ || pk >= NOVELTY_MAX_XZ ||
+                pj >= NOVELTY_MAX_Y) {
+                continue;
+            }
+            int from = (pj * NOVELTY_MAX_XZ + pk) * NOVELTY_MAX_XZ + pi;
+            int n = (di + 1) * 9 + (dj + 1) * 3 + (dk + 1);
+            if (!(sm64_cube_steps[from] & (1u << n))) {
+                continue;
+            }
+            float way = key + side * sqrtf((float)(di * di + dj * dj + dk * dk));
+            if (way < sm64_cube_way[from] && size < WAY_HEAP) {
+                sm64_cube_way[from] = way;
+                int up = size++;
+                while (up > 0 && heap_key[(up - 1) / 2] > way) {
+                    heap_key[up] = heap_key[(up - 1) / 2];
+                    heap_cube[up] = heap_cube[(up - 1) / 2];
+                    up = (up - 1) / 2;
+                }
+                heap_key[up] = way;
+                heap_cube[up] = from;
+            }
+        }
+    }
+    float longest = 0.0f;
+    for (int c = 0; c < NOVELTY_CUBES; c++) {
+        if (sm64_cube_way[c] < HUGE_VALF && sm64_cube_way[c] > longest) {
+            longest = sm64_cube_way[c];
+        }
+    }
+    sm64_way_start = sm64_start_cube >= 0 && sm64_cube_way[sm64_start_cube] < HUGE_VALF ? sm64_cube_way[sm64_start_cube]
+                                                                                         : fmaxf(longest, sm64_star_way);
+    sm64_way_reach = HUGE_VALF;
+    sm64_way_pace = HUGE_VALF;
     for (int k = 0; k < sm64_archive_size; k++) {
-        nearest = fminf(nearest, sm64_cell_distance[sm64_archive_cells[k]]);
+        int cell = sm64_archive_cells[k];
+        float way = sm64_cube_way[sm64_cell_cube[cell]];
+        if (sm64_archive[cell].frames <= env->max_ticks && way < sm64_way_reach) {
+            sm64_way_reach = way;
+        }
+        sm64_way_pace = fminf(sm64_way_pace, sm64_pace(env, cell));
+    }
+    sm64_way_updates++;
+    if (getenv("SM64_TRACE_WAY")) {
+        int finite = 0, stepped = 0;
+        for (int c = 0; c < NOVELTY_CUBES; c++) {
+            finite += sm64_cube_way[c] < HUGE_VALF;
+            stepped += sm64_cube_steps[c] != 0;
+        }
+        float x, y, z;
+        sm64_cube_centre(env, target, &x, &y, &z);
+        fprintf(stderr, "way: target %d (%.0f %.0f %.0f) %.0f from the star, visits %u, steps out %08x; %d cubes with a way, %d stepped from, longest %.0f\n",
+                target, x, y, z, target_way, sm64_cube_visits[target], sm64_cube_steps[target], finite, stepped, longest);
+    }
+}
+
+/* The way left from where Mario is, HUGE_VALF for none yet. */
+static float sm64_way_here(SM64* env) {
+    int cube = sm64_cube(env, sm64_pos(env, 0), sm64_pos(env, 1), sm64_pos(env, 2));
+    return cube >= 0 ? sm64_cube_way[cube] : HUGE_VALF;
+}
+
+/* The frontier, for a star whose place is known: a cell drawn from the ones
+ * most on pace for the star, least started-from first. With cells as fine as
+ * speed and heading make them, drawing by rarity alone is drawing nearly evenly
+ * over everywhere any episode has been: the first slide run with them spent
+ * twenty minutes in 4,800 cubes of the course, its closest approaches getting
+ * further away, and never found the star.
+ *
+ * On pace is how early the archive's way got there plus how far it still is,
+ * each as a share: of the clock, and of the way from the start to the star. A
+ * cell at 1 or under is one a run could go on from to the star at the
+ * straight-line pace the clock asks for. Nearest alone was the frontier before,
+ * and the hour on the slide that used it got within 350 units of the star, a
+ * thousand frames in: near, and far too late for a star that wants 21 seconds.
+ * The draw is from the cells within PACE_SLACK of the best. Call with the lock
+ * held. */
+#define PACE_SLACK 0.15f
+#define NEAR_MOST 4096
+static float sm64_pace(const SM64* env, int cell) {
+    float left = sm64_cell_distance[cell] / sm64_star_way;
+    if (env->frontier_way) {
+        if (sm64_way_start <= 0.0f || sm64_cube_way[sm64_cell_cube[cell]] == HUGE_VALF) {
+            return HUGE_VALF;
+        }
+        left = sm64_cube_way[sm64_cell_cube[cell]] / sm64_way_start;
+    }
+    return (float)sm64_archive[cell].frames / (float)env->max_ticks + left;
+}
+
+static int sm64_draw_near(SM64* env) {
+    if (env->frontier_way && sm64_way_updates == 0) {
+        sm64_way_update(env);
+    }
+    float best = HUGE_VALF;
+    for (int k = 0; k < sm64_archive_size; k++) {
+        best = fminf(best, sm64_pace(env, sm64_archive_cells[k]));
     }
     static int near[NEAR_MOST];
     int count = 0;
     for (int k = 0; k < sm64_archive_size && count < NEAR_MOST; k++) {
         int cell = sm64_archive_cells[k];
-        if (sm64_cell_distance[cell] <= nearest + NEAR_REACH) {
+        if (best < HUGE_VALF && sm64_pace(env, cell) <= best + PACE_SLACK) {
             near[count++] = cell;
         }
     }
@@ -968,12 +1176,22 @@ static int sm64_archive_start(SM64* env) {
         pthread_mutex_unlock(&sm64_archive_lock);
         return -1;
     }
+    /* With explore_ticks set, only the frontier races: every other start from
+     * the archive explores, on a clock of its own that starts at 0, so the
+     * archive can still build its way down the course in stages. */
+    env->racing = env->explore_ticks <= 0;
+    static unsigned starts;
+    if (env->star_known && sm64_star_way > 0.0f && starts++ % WAY_EVERY == 0) {
+        sm64_way_update(env);
+    }
     int cell;
     if (sm64_star_cell_count > 0 &&
         (double)rand_r(&env->seed) / ((double)RAND_MAX + 1.0) < env->go_explore_star) {
         cell = sm64_draw(env, sm64_star_cells, sm64_star_cell_count, sm64_cell_starts);
-    } else if (env->star_known && (double)rand_r(&env->seed) / ((double)RAND_MAX + 1.0) < env->go_explore_near) {
+    } else if (env->star_known && sm64_star_way > 0.0f &&
+               (double)rand_r(&env->seed) / ((double)RAND_MAX + 1.0) < env->go_explore_near) {
         cell = sm64_draw_near(env);
+        env->racing = 1;
     } else {
         cell = sm64_draw(env, sm64_archive_cells, sm64_archive_size, sm64_cell_visits);
     }
@@ -1046,6 +1264,8 @@ static float sm64_novelty(SM64* env, float x, float y, float z) {
     if (cube < 0) {
         return 0.0f;
     }
+    sm64_step_taken(env->last_cube, cube);
+    env->last_cube = cube;
     if (env->go_explore > 0.0f) {
         int cell = sm64_cell(env, cube);
         if (cell >= 0 && env->cell_entered[cell] != env->episode) {
@@ -1881,6 +2101,7 @@ void init(SM64* env) {
     env->star_flags_at_start = sm64_star_flags(env);
     if (env->star_known) {
         sm64_star_way = sm64_star_distance(env);
+        sm64_start_cube = sm64_cube(env, sm64_pos(env, 0), sm64_pos(env, 1), sm64_pos(env, 2));
     }
     if (sm64_level(env) != env->goal.course->level || n64_s16(&env->gym, CURR_COURSE_NUM) != env->goal.course->course ||
         (env->goal.act > 0 && n64_s16(&env->gym, CURR_ACT_NUM) != env->goal.act)) {
@@ -1960,7 +2181,7 @@ static void sm64_write_observations(SM64* env, float speed) {
     /* The clock is the env's, not the game's, so it is there with state off too:
      * the reward is made of it, and a critic that cannot see it cannot predict
      * even an episode that only runs out. */
-    obs[OBS_TIME_LEFT] = 1.0f - (float)env->tick / (float)env->max_ticks;
+    obs[OBS_TIME_LEFT] = 1.0f - (float)env->tick / (float)env->clock;
     if (!env->state) {
         return;
     }
@@ -2080,6 +2301,8 @@ void puf_reset(SM64* env) {
     env->start_cube = -1;
     env->start_frontier = -1;
     env->start_tick = 0;
+    /* Racing unless this turns out to be an exploring start from the archive. */
+    env->racing = 1;
     if (env->backward > 0.0f && (double)rand_r(&env->seed) / ((double)RAND_MAX + 1.0) < env->backward) {
         sm64_demo_start(env);
         env->from_start = 0;
@@ -2088,6 +2311,12 @@ void puf_reset(SM64* env) {
         (env->start_cube = sm64_archive_start(env)) >= 0) {
         env->from_start = 0;
         env->replayed_frames = env->trail_frames;
+        /* For a star with a time limit, the frames the way here took are spent:
+         * a full clock from a place a thousand frames in would pay for a run the
+         * game never gives the star to. */
+        if (env->go_explore_clock && env->racing) {
+            env->start_tick = env->trail_frames < env->max_ticks ? env->trail_frames : env->max_ticks - 1;
+        }
     } else if (env->random_start > 0) {
         /* A few frames of some direction, so that not every episode is the same
          * episode. Without it there is one starting state and the policy can
@@ -2103,6 +2332,7 @@ void puf_reset(SM64* env) {
         }
     }
 
+    env->clock = env->racing || env->explore_ticks <= 0 ? env->max_ticks : env->explore_ticks;
     env->tick = env->start_tick;
     env->steps = 0;
     env->episode_return = 0.0f;
@@ -2112,6 +2342,7 @@ void puf_reset(SM64* env) {
     env->airborne_frames = 0;
     env->dialog_frames = 0;
     env->deaths = 0;
+    env->last_cube = -1;
     env->last_x = sm64_pos(env, 0);
     env->last_z = sm64_pos(env, 2);
     env->episode++;
@@ -2119,6 +2350,7 @@ void puf_reset(SM64* env) {
     env->ghost_earned = 0.0f;
     env->cells_entered = 0;
     env->best_distance = env->star_known ? sm64_star_distance(env) : 0.0f;
+    env->best_way = sm64_way_here(env);
     env->progress_earned = 0.0f;
     sm64_write_observations(env, 0.0f);
 }
@@ -2146,6 +2378,7 @@ static void sm64_respawn(SM64* env) {
     env->trail_count = 0;
     env->trail_frames = 0;
     env->deaths++;
+    env->last_cube = -1;
     env->last_x = sm64_pos(env, 0);
     env->last_z = sm64_pos(env, 2);
 }
@@ -2166,11 +2399,30 @@ static float sm64_progress(SM64* env) {
     if (!env->star_known || env->progress <= 0.0f || sm64_star_way <= 0.0f || !sm64_in_the_world(env)) {
         return 0.0f;
     }
+    if (env->progress_way) {
+        /* Along the way: the cube he is in, by the steps taken from it toward
+         * the star. A cube with no way yet pays nothing, and the first one with
+         * a way only sets where the episode stands. */
+        float way = sm64_way_here(env);
+        if (way == HUGE_VALF || sm64_way_start <= 0.0f) {
+            return 0.0f;
+        }
+        if (env->best_way == HUGE_VALF || way >= env->best_way) {
+            env->best_way = fminf(env->best_way, way);
+            return 0.0f;
+        }
+        float hurry = 1.0f - env->progress_hurry * (float)env->tick / (float)env->clock;
+        float pay = env->progress * (env->best_way - way) / sm64_way_start * fmaxf(hurry, 0.0f);
+        env->best_way = way;
+        env->best_distance = fminf(env->best_distance, sm64_star_distance(env));
+        env->progress_earned += pay;
+        return pay;
+    }
     float distance = sm64_star_distance(env);
     if (distance >= env->best_distance) {
         return 0.0f;
     }
-    float hurry = 1.0f - env->progress_hurry * (float)env->tick / (float)env->max_ticks;
+    float hurry = 1.0f - env->progress_hurry * (float)env->tick / (float)env->clock;
     float pay = env->progress * (env->best_distance - distance) / sm64_star_way * fmaxf(hurry, 0.0f);
     env->best_distance = distance;
     env->progress_earned += pay;
@@ -2197,6 +2449,9 @@ static void sm64_end_episode(SM64* env, int how) {
     env->log.cells += (float)env->cells_entered;
     env->log.explored += (float)sm64_cubes_explored;
     env->log.from_start += (float)env->from_start;
+    env->log.racing += (float)env->racing;
+    env->log.reach += sm64_way_reach < HUGE_VALF ? sm64_way_reach : 0.0f;
+    env->log.pace += sm64_way_pace < HUGE_VALF ? sm64_way_pace : 0.0f;
     env->log.start_perf += (float)(star && env->from_start);
     env->log.archive += (float)sm64_archive_size;
     env->log.replayed += (float)env->replayed_frames;
@@ -2245,7 +2500,7 @@ void puf_step(SM64* env) {
     sm64_watch_camera(env);
 
     uint32_t action = sm64_action(env);
-    float step_cost = env->time_penalty * (float)env->frameskip / (float)env->max_ticks;
+    float step_cost = env->time_penalty * (float)env->frameskip / (float)env->clock;
 
     /* The star, the frame he touches it. The dance and the warp out come after,
      * and are the same for every run, so they are not counted. */
@@ -2289,15 +2544,15 @@ void puf_step(SM64* env) {
             sm64_respawn(env);
             agent->rewards[0] = -step_cost;
             env->episode_return += agent->rewards[0];
-            if (env->tick >= env->max_ticks) {
+            if (env->tick >= env->clock) {
                 sm64_end_episode(env, ENDED_CLOCK);
                 return;
             }
             sm64_write_observations(env, 0.0f);
             return;
         }
-        int left = env->max_ticks - env->tick;
-        agent->rewards[0] = -step_cost - env->time_penalty * (float)(left > 0 ? left : 0) / (float)env->max_ticks;
+        int left = env->clock - env->tick;
+        agent->rewards[0] = -step_cost - env->time_penalty * (float)(left > 0 ? left : 0) / (float)env->clock;
         env->episode_return += agent->rewards[0];
         env->deaths++;
         sm64_end_episode(env, ENDED_EARLY);
@@ -2325,7 +2580,7 @@ void puf_step(SM64* env) {
     agent->rewards[0] = -step_cost + sm64_novelty(env, x, sm64_pos(env, 1), z) + sm64_progress(env);
     env->episode_return += agent->rewards[0];
 
-    if (env->tick >= env->max_ticks) {
+    if (env->tick >= env->clock) {
         sm64_end_episode(env, ENDED_CLOCK);
         return;
     }
@@ -2379,6 +2634,7 @@ void puf_init(Env* env, Dict* kwargs) {
     }
     env->frameskip = (int)dict_get(kwargs, "frameskip");
     env->max_ticks = (int)dict_get(kwargs, "max_ticks");
+    env->explore_ticks = (int)dict_get(kwargs, "explore_ticks");
     env->random_start = (int)dict_get(kwargs, "random_start");
     env->time_penalty = (float)dict_get(kwargs, "time_penalty");
     env->novelty = (float)dict_get(kwargs, "novelty");
@@ -2397,6 +2653,9 @@ void puf_init(Env* env, Dict* kwargs) {
     env->go_explore_star = (float)dict_get(kwargs, "go_explore_star");
     env->go_explore_near = (float)dict_get(kwargs, "go_explore_near");
     env->go_explore_frames = (float)dict_get(kwargs, "go_explore_frames");
+    env->go_explore_clock = (int)dict_get(kwargs, "go_explore_clock");
+    env->frontier_way = (int)dict_get(kwargs, "frontier_way");
+    env->progress_way = (int)dict_get(kwargs, "progress_way");
     env->go_explore_seed = (int)dict_get(kwargs, "go_explore_seed");
     env->ghost = (float)dict_get(kwargs, "ghost");
     env->backward = (float)dict_get(kwargs, "backward");
@@ -2426,6 +2685,9 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "cells", log->cells);
     dict_set(out, "explored", log->explored);
     dict_set(out, "from_start", log->from_start);
+    dict_set(out, "racing", log->racing);
+    dict_set(out, "reach", log->reach);
+    dict_set(out, "pace", log->pace);
     dict_set(out, "start_perf", log->start_perf);
     dict_set(out, "archive", log->archive);
     dict_set(out, "replayed", log->replayed);

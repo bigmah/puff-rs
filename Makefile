@@ -99,7 +99,7 @@ sm64-robustify: sm64
 # runs land in build/sm64/$(STAR)/fastest/ as they are found. Advantages are
 # normalized and entropy is held with damping: see NEXT.md in demos/peach-slide.
 sm64-speedrun: sm64
-	$(PUFFERL) train sm64 $(STAR_RUN) --env.go-explore 0.75 --env.go-explore-star 0.75 --env.go-explore-frames 1 --env.ghost 0.02 \
+	$(PUFFERL) train sm64 $(STAR_RUN) --env.go-explore 0.75 --env.go-explore-star 0.75 --env.go-explore-frames 1 --env.go-explore-clock 1 --env.ghost 0.02 \
 		--train.norm-adv 1 --train.learning-rate 0.005 --train.ent-coef 0.007 --train.ent-coef-rate 0.0025 \
 		--train.ent-coef-damping 0.5 $(ARGS)
 

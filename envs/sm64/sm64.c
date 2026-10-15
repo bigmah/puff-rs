@@ -325,8 +325,10 @@ static int explore(int games, double seconds) {
                 if (sm64_demo_best > 0 && sm64_demo_best < INT_MAX) {
                     snprintf(fastest, sizeof(fastest), "%d frames", sm64_demo_best);
                 }
-                printf("%5.0fs  %5d cubes in the archive  %6u episodes  %4u stars  fastest %s\n",
-                       now() - started, sm64_archive_size, episodes, stars, fastest);
+                printf("%5.0fs  %5d cells in the archive  %6u episodes  %4u stars  fastest %s"
+                       "  reach %5.0f  pace %.2f\n",
+                       now() - started, sm64_archive_size, episodes, stars, fastest,
+                       sm64_way_reach < HUGE_VALF ? sm64_way_reach : -1.0f, sm64_way_pace < HUGE_VALF ? sm64_way_pace : -1.0f);
                 fflush(stdout);
             }
         }
