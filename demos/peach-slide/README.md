@@ -148,6 +148,26 @@ The fastest folder is now 674 to 716, all of this family, and the 750 family is
 out of it. Still none from the top of the slide: like every record before it,
 this is a run the archive assembled from starts partway down.
 
+## From a blank slate: 700 frames
+
+`star-700-touch.demo` is the fastest touch from a run that started with nothing:
+a new policy, an empty archive (`go_explore_seed` 0) and no ghost to race at
+first. The star is his on frame 700, 23.3 seconds from the savestate, in 349
+inputs; `route-700-touch.txt` is its trace. It came from `make sm64-speedrun`
+with `--train.total-timesteps 140_000_000`, started 2026-10-16 evening: 140M
+steps in 19 hours 50 minutes, the rate falling from 3.5K a second to 1.1 to
+1.9K as the archive grew to 142K cubes. The record fell 1317, 965, 887 and 815
+in the first three minutes, was 781 by half an hour, then held near 777 to 767
+until about seven hours in, when it went 756, 750, 738, 732, 722, 716, 712, 706,
+704, 702 and finally 700 at 16 hours 50 minutes; the last three hours found
+nothing faster. The previous blank-slate best was 718.
+
+It takes the long flight the 674 does, but leaves the upper track sooner: in
+the air by frame 270 and on the lower track by 330, where the 706 (the best
+twelve hours in) was still flying at 338 and landed near 368. It is at the
+bottom by 540 with the star spawning at 566. Still none from the top of the
+slide: start_perf read 0 for the whole run.
+
 Everything below applies to these the same way, with the file name in place of
 `star-648.demo`.
 
