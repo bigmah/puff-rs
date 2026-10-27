@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build an env for PufferLib 5.0, on a Mac or on Linux.
 #
-#   ./build.sh [platformer|sm64|sort|kronecker_factorization]
+#   ./build.sh [platformer|sm64|sort|kronecker_factorization|bloons]
 #
 #       build/vecenv_<env>.dylib    the env in a vecenv, for the trainer to train on
 #                                   (.so on Linux)
@@ -240,10 +240,25 @@ PATHS
     CFLAGS+=(-I"$BUILD/sm64" -I"$N64BUNDLER/ModernReality/include/modernreality")
 fi
 
+ENV_LIBS=()
+if [ "$ENV" = bloons ]; then
+    # Bloons TD 3's native port (github.com/bigmah/bloons), whose simulation
+    # native/btd3-env builds into a static library with a C ABI. BLOONS names the
+    # checkout; by default it sits beside this one.
+    BLOONS=${BLOONS:-$(cd .. && pwd)/bloons}
+    if [ ! -f "$BLOONS/native/btd3-env/Cargo.toml" ]; then
+        echo "No Bloons TD 3 port with native/btd3-env at $BLOONS; set BLOONS to the checkout" && exit 1
+    fi
+    echo "Building the Bloons TD 3 simulation..."
+    cargo build --release --lib --manifest-path "$BLOONS/native/btd3-env/Cargo.toml"
+    ENV_LIBS=("$BLOONS/native/btd3-env/target/release/libbtd3_env.a")
+    CFLAGS+=(-DBTD3_DATA="\"$BLOONS/native/btd3/data\"")
+fi
+
 echo "Compiling the $ENV env..."
 "$CC" -shared -fPIC -fvisibility=hidden "${CFLAGS[@]}" \
     -DENV_HEADER="\"$ENV_DIR/$ENV.h\"" -DPUFFER_ENV_NAME="\"$ENV\"" \
-    vecenv.c "${RAYLIB_LIBS[@]}" "${OMP_FLAGS[@]}" -lm -o "$BUILD/vecenv_$ENV.$LIB_EXT"
+    vecenv.c "${ENV_LIBS[@]+"${ENV_LIBS[@]}"}" "${RAYLIB_LIBS[@]}" "${OMP_FLAGS[@]}" -lm -o "$BUILD/vecenv_$ENV.$LIB_EXT"
 echo "Built: $BUILD/vecenv_$ENV.$LIB_EXT"
 
 if [ "$ENV" = platformer ]; then

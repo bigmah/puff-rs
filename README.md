@@ -45,6 +45,15 @@ make eval     # watch the most trained checkpoint
 make test     # the trainer's tests
 ```
 
+### Bloons TD 3
+
+The first track on easy, in the native Rust port of the game ([bigmah/bloons](https://github.com/bigmah/bloons), branch `rl-env`), checked out beside this one or wherever `BLOONS` says. `build.sh` builds its simulation into a static library and links it into the env. Each step is a build, an upgrade or a wait on a 20 px grid, then half a second of game; rounds run back to back into freeplay, and `score` is the round the game ends on.
+
+```sh
+make train ENV=bloons
+make eval ENV=bloons
+```
+
 ### Super Mario 64
 
 The one thing this needs from you is your own dump of the cartridge, Super Mario 64 (USA). Put it at `sm64.z64` in the top of the checkout, or point `SM64_ROM` at it. `build.sh` checks that it is that exact dump (game id `NSME`, ROM hash `8a90daa33e09a265`), because the env reads Mario out of memory at the addresses that cartridge uses. No game data goes into git: the ROM is read where it is, and everything derived from it lands in the gitignored `build/`.
@@ -70,6 +79,7 @@ examples/             GPU benchmarks (make bench)
 vecenv.c              PufferLib 5.0's CPU vecenv, compiled around each env
 build.sh              builds an env into build/vecenv_<env>.dylib (.so on Linux)
 envs/platformer/      platformer.h (the env), platformer.c (human play), platformer.ini
+envs/bloons/          bloons.h (the env, around the bloons repo's native/btd3-env), bloons.ini
 envs/sm64/            sm64.h (the env), n64b_gym.h (the game process), sm64.c (sm64_tool),
                       sm64.ini, stars/<star>.ini
 demos/peach-slide/    the record runs: inputs, route traces, videos, notes
