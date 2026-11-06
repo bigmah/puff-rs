@@ -1,6 +1,6 @@
 # puff-rs
 
-Reinforcement learning experiments on [PufferLib](https://github.com/PufferAI/PufferLib) 5.0, in Rust and C, including an agent that speedruns a star in the real Super Mario 64.
+Reinforcement learning experiments on [PufferLib](https://github.com/PufferAI/PufferLib) 5.0, in Rust (with C envs behind a bridge), including an agent that speedruns a star in the real Super Mario 64.
 
 <p align="center">
   <a href="demos/peach-slide/star-674-touch.mp4">
@@ -10,9 +10,10 @@ Reinforcement learning experiments on [PufferLib](https://github.com/PufferAI/Pu
 
 The result so far, above: the under-21-seconds star of Peach's Secret Slide in **674 frames (22.5 s)** from the course's start to touching the star, by a route training found on its own. Ten seconds in, it jumps off the upper track and free-falls 6,750 units onto the lower one. Click it for the [full-quality video](demos/peach-slide/star-674-touch.mp4). The inputs, traces and earlier records are in [`demos/peach-slide/`](demos/peach-slide/).
 
-Three things live here:
+Four things live here:
 
 - **A trainer** (`src/`). PufferLib 5.0's CUDA trainer, ported to Rust on [wgpu](https://wgpu.rs), so it runs on whatever GPU the machine has: Metal, Vulkan or DX12. No CUDA, no Python, no autograd. Every forward and backward pass is a WGSL compute kernel.
+- **The env API** (`crates/puffer-env`). The `Env` trait a Rust env implements, with no C anywhere. `envs/squared/` is the example: PufferLib's first env, ported.
 - **A platformer** (`envs/platformer/`). A small 2D platformer written as a PufferLib C env. It trains to the flag in 45 seconds and is the trainer's smoke test.
 - **Super Mario 64** (`envs/sm64/`). The real cartridge as an environment. [N64Bundler](https://github.com/bigmah/n64bundler) statically recompiles your ROM to native code, one copy of the game runs per agent, and the task is to get one named star as fast as possible.
 
@@ -23,8 +24,7 @@ You need Rust ([rustup](https://rustup.rs)) and a C compiler. Everything else (t
 **macOS**
 
 ```sh
-brew install libomp          # OpenMP, which Apple's clang doesn't ship
-brew install cmake ninja     # sm64 only
+brew install libomp cmake ninja   # sm64 only (sm64_tool steps games on OpenMP threads)
 ```
 
 sm64 also needs Xcode, whose Metal toolchain compiles the renderer's shaders. Xcode 26 downloads it separately (`xcodebuild -downloadComponent MetalToolchain`), and the build says so if it's missing.
@@ -67,8 +67,10 @@ Pass trainer flags with `ARGS`, e.g. `make train ARGS="--train.total-timesteps 1
 src/                  the trainer; src/kernels/ holds its WGSL compute kernels
 tests/                kernels against the CPU, acting against training, golden numbers
 examples/             GPU benchmarks (make bench)
-vecenv.c              PufferLib 5.0's CPU vecenv, compiled around each env
-build.sh              builds an env into build/vecenv_<env>.dylib (.so on Linux)
+crates/puffer-env/    the Env trait, Config and Log: what a Rust env is to the trainer
+cenv.c                the C ABI bridge, compiled around each C env
+build.sh              builds a C env into build/cenv_<env>.dylib (.so on Linux)
+envs/squared/         a Rust env (squared.rs, Cargo.toml, squared.ini)
 envs/platformer/      platformer.h (the env), platformer.c (human play), platformer.ini
 envs/sm64/            sm64.h (the env), n64b_gym.h (the game process), sm64.c (sm64_tool),
                       sm64.ini, stars/<star>.ini
@@ -95,7 +97,10 @@ cargo build --release
 - **PPO as 5.0 has it.** Each minibatch computes advantages from its own values before the update (GAE, or V-trace with `vtrace = 1`) and doesn't normalize them. Minibatches are whole agent rows, with no prioritized replay. The MinGRU's state carries across horizons and clears where an episode ends.
 - **Muon**, on the clipped gradient.
 
-**Envs** are PufferLib 5.0 C envs. `build.sh` compiles `vecenv.c` around one into a shared library of its own, and the trainer loads it (`src/vecenv.rs`). The env steps on CPU threads and the policy runs on the GPU.
+**Envs** step in the trainer's vecenv (`src/vecenv.rs`): it makes envs until it has `vec.total_agents` agents, owns the observation, action, reward and terminal buffers, steps the envs on `vec.num_threads` threads, and averages their logs. The policy runs on the GPU. An env is one of two kinds:
+
+- **A Rust env** implements `puffer_env::Env` (`crates/puffer-env`, which has no dependencies) and is called with its own agents' slices of the buffers. To add one: make `envs/<env>/` a crate with a `Cargo.toml`, an `<env>.ini` and the env, add it to the workspace and `[dependencies]` in the top `Cargo.toml`, and give it a line in `src/envs.rs`. `cargo build` builds it into the trainer; there is no library to load. `envs/squared/` is a small one to copy.
+- **A C env** is a PufferLib 5.0 C env (`puf_init`, `puf_step`, `struct Log` and the rest, as in PufferLib's ocean). `build.sh` compiles the bridge, `cenv.c`, around it into a shared library, which makes, binds, steps and closes one env at a time; `src/cenv.rs` loads it and makes each env an `Env` like any other.
 
 **Config** works as in 5.0. Values are read in this order, later over earlier:
 

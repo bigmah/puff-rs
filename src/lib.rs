@@ -8,8 +8,9 @@
 //! checkpoints PufferLib's own eval can read, and its dashboard. Like the CUDA trainer it
 //! has no autograd: every backward pass is a kernel written for it (src/kernels).
 //!
-//! Envs are PufferLib 5.0 C envs, which build.sh compiles into a vecenv library (vecenv.c)
-//! that this loads:
+//! Envs step in its own vecenv (src/vecenv.rs). An env is a Rust env, which implements
+//! puffer_env::Env (crates/puffer-env) and is named in src/envs.rs, or a PufferLib 5.0 C
+//! env, which build.sh compiles into a bridge library (cenv.c) that this loads:
 //!
 //! ```text
 //! pufferl train platformer [--config FILE ...] [--section.key=value ...]
@@ -17,9 +18,11 @@
 //! ```
 
 pub mod actor;
+pub mod cenv;
 pub mod checkpoint;
 pub mod config;
 pub mod dashboard;
+pub mod envs;
 pub mod gpu;
 pub mod learner;
 pub mod model;

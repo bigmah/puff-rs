@@ -1,6 +1,6 @@
 /* Platformer: a single-level 2D platformer. Run right, clear the pits and
  * spikes, and touch the flag. A PufferLib 5.0 env: the same puf_step drives
- * human play (platformer.c) and training (vecenv.c).
+ * human play (platformer.c) and training (cenv.c).
  *
  * Actions: two discrete heads
  *   move: 0 none, 1 left, 2 right

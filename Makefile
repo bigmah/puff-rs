@@ -1,7 +1,8 @@
 .PHONY: setup trainer test bench build play train eval sm64 sm64-state sm64-train sm64-explore sm64-robustify sm64-speedrun sm64-picture sm64-watch sm64-replay sm64-demo sm64-bench
 
 # Which env to build and train. Each builds into a library of its own
-# (build/vecenv_<env>.dylib, or .so), so building one leaves the others as they are.
+# (build/cenv_<env>.dylib, or .so), so building one leaves the others as they are. A
+# Rust env (envs/<env>/Cargo.toml) is built into the trainer and needs nothing here.
 ENV ?= platformer
 
 # The trainer (src/) runs on wgpu: Metal, Vulkan or DX12, whatever the machine has
@@ -18,7 +19,7 @@ trainer:
 # The kernels against the CPU, acting against training, and the whole of a training
 # step against golden numbers (tests/golden)
 test:
-	cargo test --release
+	cargo test --release --workspace
 
 # Where the time goes on this GPU, with no env
 bench:

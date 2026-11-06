@@ -1,179 +1,267 @@
-//! The env, through vecenv.c: build/vecenv_ENV.dylib (.so, .dll), which build.sh compiles
-//! around a PufferLib 5.0 C env. Observations, actions, rewards and terminals are the
-//! library's own memory, read and written in place.
+//! The vecenv: PufferLib 5.0's CPU vecenv (env_setup and the worker loop in
+//! src/pufferl.cu) for any [`Env`]. Envs are made in order until there are total_agents
+//! agents, each told its index, and step together on num_threads threads. The
+//! observations, actions, rewards, terminals and action masks of every agent are flat
+//! arrays here, which each env sees its own agents' slices of.
+//!
+//! A Rust env is an [`Env`] registered in src/envs.rs. A C env is a PufferLib 5.0 C env
+//! that build.sh compiles into a bridge library (cenv.c), which src/cenv.rs makes an
+//! [`Env`] of; the stepping, threads and logs here are the same for both.
 
-use std::ffi::{c_char, c_double, c_int, c_void, CString};
 use std::path::Path;
 
-use libloading::{Library, Symbol};
+use puffer_env::{Agents, Config, Env, Obs};
+use rayon::prelude::*;
 
-/// PUF_DICT_MAX_KEY
-const KEY_BYTES: usize = 128;
-const MAX_LOG_KEYS: usize = 64;
+/// A vecenv of envs of one kind, whatever kind that is
+trait Vectorized {
+    fn reset(&mut self);
+    fn step(&mut self);
+    fn observations(&self, out: &mut Vec<f32>);
+    fn rewards(&self) -> &[f32];
+    fn terminals(&self) -> &[f32];
+    fn set_actions(&mut self, actions: &[u32]);
+    fn log(&mut self, clear: bool) -> Vec<(String, f64)>;
+    fn render(&mut self, env_id: usize);
+    fn window_closed(&self) -> bool;
+    fn close(&mut self);
+}
 
 pub struct VecEnv {
-    lib: Library,
-    vec: *mut c_void,
     pub total_agents: usize,
     pub obs_size: usize,
     pub act_sizes: Vec<usize>,
-    /// 1 for unsigned char observations, 4 for float
-    obs_bytes: usize,
-    observations: *const u8,
-    actions: *mut f32,
-    rewards: *const f32,
-    terminals: *const f32,
-}
-
-/// Open the env's library for good. It steps envs on OpenMP threads, which outlive every
-/// call into it and wait between calls inside the OpenMP runtime the library brought in.
-/// Unloading the library as the trainer exits unloads that runtime under them, and the
-/// first to wake returns into memory that is gone: with GCC's libgomp on Linux, a
-/// segfault at the end of about one run in ten. RTLD_NODELETE keeps it mapped until the
-/// process ends, which is when its threads do. The rest are libloading's own flags.
-#[cfg(unix)]
-unsafe fn open(path: &Path) -> Result<Library, libloading::Error> {
-    let flags = libc::RTLD_LAZY | libc::RTLD_LOCAL | libc::RTLD_NODELETE;
-    libloading::os::unix::Library::open(Some(path), flags).map(Library::from)
-}
-
-#[cfg(not(unix))]
-unsafe fn open(path: &Path) -> Result<Library, libloading::Error> {
-    Library::new(path)
-}
-
-pub fn library_name(env_name: &str) -> String {
-    let extension = if cfg!(target_os = "macos") { "dylib" } else if cfg!(windows) { "dll" } else { "so" };
-    format!("vecenv_{env_name}.{extension}")
+    inner: Box<dyn Vectorized>,
 }
 
 impl VecEnv {
+    /// The env called env_name: a Rust env if src/envs.rs has one by that name, and
+    /// otherwise the C env build.sh built into build/cenv_<env_name>.
     pub fn new(root: &Path, env_name: &str, env_config: &[(String, String)], total_agents: usize, num_threads: usize) -> Self {
-        let path = root.join("build").join(library_name(env_name));
-        if !path.exists() {
-            crate::fail(&format!("{} not found: run ./build.sh {env_name}", path.display()));
-        }
-        // The library is an env someone compiled to be trained on; loading it runs it
-        let lib = unsafe { open(&path) }.unwrap_or_else(|e| crate::fail(&format!("{}: {e}", path.display())));
+        let config = Config::new(env_config.to_vec());
+        crate::envs::native(env_name, &config, total_agents, num_threads)
+            .unwrap_or_else(|| crate::cenv::load(root, env_name, &config, total_agents, num_threads))
+    }
 
-        let keys: Vec<CString> = env_config.iter().map(|(k, _)| CString::new(k.as_str()).unwrap()).collect();
-        let values: Vec<CString> = env_config.iter().map(|(_, v)| CString::new(v.as_str()).unwrap()).collect();
-        let key_ptrs: Vec<*const c_char> = keys.iter().map(|k| k.as_ptr()).collect();
-        let value_ptrs: Vec<*const c_char> = values.iter().map(|v| v.as_ptr()).collect();
-
-        unsafe {
-            let create: Symbol<unsafe extern "C" fn(c_int, c_int, c_int, *const *const c_char, *const *const c_char) -> *mut c_void>
-                = lib.get(b"vec_create").unwrap_or_else(|e| crate::fail(&format!("{}: {e}", path.display())));
-            let vec = create(total_agents as c_int, num_threads as c_int, keys.len() as c_int, key_ptrs.as_ptr(), value_ptrs.as_ptr());
-
-            let int = |name: &[u8]| -> usize {
-                let f: Symbol<unsafe extern "C" fn() -> c_int> = lib.get(name).expect("vecenv symbol");
-                f() as usize
-            };
-            // Only final once the envs are made: an env may size its observation from its config
-            let obs_size = int(b"vec_obs_size");
-            let num_atns = int(b"vec_num_atns");
-            let obs_bytes = int(b"vec_obs_bytes");
-            let sizes: Symbol<unsafe extern "C" fn() -> *const c_int> = lib.get(b"vec_act_sizes").expect("vecenv symbol");
-            let act_sizes = std::slice::from_raw_parts(sizes(), num_atns).iter().map(|&a| a as usize).collect();
-
-            let ptr = |name: &[u8]| -> *mut c_void {
-                let f: Symbol<unsafe extern "C" fn(*mut c_void) -> *mut c_void> = lib.get(name).expect("vecenv symbol");
-                f(vec)
-            };
-            let observations = ptr(b"vec_observations") as *const u8;
-            let actions = ptr(b"vec_actions") as *mut f32;
-            let rewards = ptr(b"vec_rewards") as *const f32;
-            let terminals = ptr(b"vec_terminals") as *const f32;
-            Self { lib, vec, total_agents, obs_size, act_sizes, obs_bytes, observations, actions, rewards, terminals }
+    /// Envs made by make(0), make(1), ... until they have total_agents agents between them
+    pub fn from_envs<E: Env + 'static>(make: impl FnMut(usize) -> E, total_agents: usize, num_threads: usize) -> Self {
+        let envs = Envs::new(make, total_agents, num_threads);
+        Self {
+            total_agents,
+            obs_size: envs.obs_size,
+            act_sizes: envs.act_sizes.clone(),
+            inner: Box::new(envs),
         }
     }
 
-    fn call(&self, name: &[u8]) {
-        unsafe {
-            let f: Symbol<unsafe extern "C" fn(*mut c_void)> = self.lib.get(name).expect("vecenv symbol");
-            f(self.vec);
-        }
-    }
-
+    /// Fresh episodes everywhere, as env_restart starts a run
     pub fn reset(&mut self) {
-        self.call(b"vec_reset");
+        self.inner.reset();
     }
 
     /// One step of every env, on the actions in place.
     pub fn step(&mut self) {
-        self.call(b"vec_step");
+        self.inner.step();
     }
 
     /// Every agent's observation as floats, which is what the policy's first matrix takes.
     pub fn observations(&self, out: &mut Vec<f32>) {
-        let count = self.total_agents * self.obs_size;
-        out.clear();
-        unsafe {
-            if self.obs_bytes == 1 {
-                out.extend(std::slice::from_raw_parts(self.observations, count).iter().map(|&b| b as f32));
-            } else {
-                out.extend_from_slice(std::slice::from_raw_parts(self.observations as *const f32, count));
-            }
-        }
+        self.inner.observations(out);
     }
 
     pub fn rewards(&self) -> &[f32] {
-        unsafe { std::slice::from_raw_parts(self.rewards, self.total_agents) }
+        self.inner.rewards()
     }
 
     pub fn terminals(&self) -> &[f32] {
-        unsafe { std::slice::from_raw_parts(self.terminals, self.total_agents) }
+        self.inner.terminals()
     }
 
     /// The env reads its actions as floats, one for each head of each agent.
     pub fn set_actions(&mut self, actions: &[u32]) {
-        let out = unsafe { std::slice::from_raw_parts_mut(self.actions, self.total_agents * self.act_sizes.len()) };
-        for (slot, &action) in out.iter_mut().zip(actions) {
-            *slot = action as f32;
-        }
+        self.inner.set_actions(actions);
     }
 
     /// Env stats averaged over the episodes since the last clear, and n, how many
     pub fn log(&mut self, clear: bool) -> Vec<(String, f64)> {
-        let mut keys = vec![0u8; MAX_LOG_KEYS * KEY_BYTES];
-        let mut values = [0f64; MAX_LOG_KEYS];
-        let count = unsafe {
-            let f: Symbol<unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut c_char, *mut c_double) -> c_int>
-                = self.lib.get(b"vec_log").expect("vecenv symbol");
-            f(self.vec, clear as c_int, MAX_LOG_KEYS as c_int, keys.as_mut_ptr() as *mut c_char, values.as_mut_ptr())
-        } as usize;
-        (0..count).map(|i| {
-            let key = &keys[i * KEY_BYTES..(i + 1) * KEY_BYTES];
-            let end = key.iter().position(|&b| b == 0).unwrap_or(KEY_BYTES);
-            (String::from_utf8_lossy(&key[..end]).into_owned(), values[i])
-        }).collect()
+        self.inner.log(clear)
     }
 
     pub fn render(&mut self, env_id: usize) {
-        unsafe {
-            let f: Symbol<unsafe extern "C" fn(*mut c_void, c_int)> = self.lib.get(b"vec_render").expect("vecenv symbol");
-            f(self.vec, env_id as c_int);
-        }
+        self.inner.render(env_id);
     }
 
     pub fn window_closed(&self) -> bool {
-        unsafe {
-            let f: Symbol<unsafe extern "C" fn() -> c_int> = self.lib.get(b"vec_window_closed").expect("vecenv symbol");
-            f() != 0
-        }
+        self.inner.window_closed()
     }
 
     pub fn close(&mut self) {
-        if !self.vec.is_null() {
-            self.call(b"vec_close");
-            self.vec = std::ptr::null_mut();
-        }
+        self.inner.close();
     }
 }
 
 impl Drop for VecEnv {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+struct Envs<E: Env> {
+    envs: Vec<E>,
+    /// How many agents each env has, in order
+    agents: Vec<usize>,
+    obs_size: usize,
+    act_sizes: Vec<usize>,
+    mask_size: usize,
+    observations: Vec<E::Obs>,
+    actions: Vec<f32>,
+    rewards: Vec<f32>,
+    terminals: Vec<f32>,
+    action_mask: Vec<u8>,
+    /// None for one thread, which steps envs on the thread that asks
+    pool: Option<rayon::ThreadPool>,
+    threads: usize,
+}
+
+impl<E: Env + 'static> Envs<E> {
+    fn new(mut make: impl FnMut(usize) -> E, total_agents: usize, num_threads: usize) -> Self {
+        let mut envs = Vec::new();
+        let mut agents = Vec::new();
+        let mut count = 0;
+        while count < total_agents {
+            let env = make(envs.len());
+            let n = env.num_agents();
+            if n == 0 {
+                crate::fail("vecenv: an env with no agents");
+            }
+            count += n;
+            agents.push(n);
+            envs.push(env);
+        }
+        if count != total_agents {
+            crate::fail(&format!("vecenv: {} envs make {count} agents, not the {total_agents} asked for", envs.len()));
+        }
+        // Only final once the envs are made: an env may size its observation from its config
+        let obs_size = envs[0].obs_size();
+        let act_sizes = envs[0].act_sizes();
+        if let Some(i) = envs.iter().position(|env| env.obs_size() != obs_size || env.act_sizes() != act_sizes) {
+            crate::fail(&format!("vecenv: env {i}'s observations or actions are not the size env 0's are"));
+        }
+        let mask_size = act_sizes.iter().sum();
+        let threads = num_threads.max(1);
+        let pool = (threads > 1).then(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("vecenv-{i}"))
+                .build()
+                .unwrap_or_else(|e| crate::fail(&format!("vecenv: {e}")))
+        });
+        Self {
+            envs,
+            agents,
+            obs_size,
+            mask_size,
+            observations: vec![E::Obs::default(); total_agents * obs_size],
+            actions: vec![0.0; total_agents * act_sizes.len()],
+            rewards: vec![0.0; total_agents],
+            terminals: vec![0.0; total_agents],
+            action_mask: vec![1; total_agents * mask_size],
+            act_sizes,
+            pool,
+            threads,
+        }
+    }
+
+    /// f on every env with its agents' slices, on the vecenv's threads
+    fn each(&mut self, f: fn(&mut E, Agents<'_, E::Obs>)) {
+        self.rewards.fill(0.0);
+        self.terminals.fill(0.0);
+        let (obs_size, num_atns, mask_size) = (self.obs_size, self.act_sizes.len(), self.mask_size);
+        let mut observations = self.observations.as_mut_slice();
+        let mut actions = self.actions.as_slice();
+        let mut rewards = self.rewards.as_mut_slice();
+        let mut terminals = self.terminals.as_mut_slice();
+        let mut action_mask = self.action_mask.as_mut_slice();
+        let mut work = Vec::with_capacity(self.envs.len());
+        for (env, &n) in self.envs.iter_mut().zip(&self.agents) {
+            let (o, rest) = std::mem::take(&mut observations).split_at_mut(n * obs_size);
+            observations = rest;
+            let (a, rest) = actions.split_at(n * num_atns);
+            actions = rest;
+            let (r, rest) = std::mem::take(&mut rewards).split_at_mut(n);
+            rewards = rest;
+            let (t, rest) = std::mem::take(&mut terminals).split_at_mut(n);
+            terminals = rest;
+            let (m, rest) = std::mem::take(&mut action_mask).split_at_mut(n * mask_size);
+            action_mask = rest;
+            let agents = Agents {
+                observations: o,
+                actions: a,
+                rewards: r,
+                terminals: t,
+                action_mask: m,
+                obs_size,
+                num_atns,
+                mask_size,
+            };
+            work.push((env, agents));
+        }
+        match &self.pool {
+            None => work.into_iter().for_each(|(env, agents)| f(env, agents)),
+            Some(pool) => {
+                // A few runs of envs a thread, so a slow env holds up less than its share
+                let min_len = (work.len() / (self.threads * 4)).max(1);
+                pool.install(|| work.into_par_iter().with_min_len(min_len).for_each(|(env, agents)| f(env, agents)));
+            }
+        }
+    }
+}
+
+impl<E: Env + 'static> Vectorized for Envs<E> {
+    fn reset(&mut self) {
+        self.each(|env, agents| env.reset(agents));
+    }
+
+    fn step(&mut self) {
+        self.each(|env, agents| env.step(agents));
+    }
+
+    fn observations(&self, out: &mut Vec<f32>) {
+        out.clear();
+        out.extend(self.observations.iter().map(|&o| o.to_f32()));
+    }
+
+    fn rewards(&self) -> &[f32] {
+        &self.rewards
+    }
+
+    fn terminals(&self) -> &[f32] {
+        &self.terminals
+    }
+
+    fn set_actions(&mut self, actions: &[u32]) {
+        for (slot, &action) in self.actions.iter_mut().zip(actions) {
+            *slot = action as f32;
+        }
+    }
+
+    fn log(&mut self, clear: bool) -> Vec<(String, f64)> {
+        E::summarize(&mut self.envs, clear)
+    }
+
+    fn render(&mut self, env_id: usize) {
+        if let Some(env) = self.envs.get_mut(env_id) {
+            env.render();
+        }
+    }
+
+    fn window_closed(&self) -> bool {
+        self.envs.first().is_some_and(|env| env.window_closed())
+    }
+
+    /// Envs close as they drop
+    fn close(&mut self) {
+        self.envs.clear();
+        self.agents.clear();
     }
 }

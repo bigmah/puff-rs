@@ -3,16 +3,20 @@
 #
 #   ./build.sh [platformer|sm64|sort|kronecker_factorization]
 #
-#       build/vecenv_<env>.dylib    the env in a vecenv, for the trainer to train on
+#       build/cenv_<env>.dylib      the env behind a C ABI, for the trainer to train on
 #                                   (.so on Linux)
 #       build/platformer            human play
 #       build/kronecker_factorization   count and list the factorizations of an M x N
 #       build/sm64_tool             savestates, watching, benchmarking
 #
 # PufferLib's own build.sh compiles an env from its ocean/ into the CUDA trainer,
-# which only an NVIDIA card runs, or into a CPU play binary. This compiles vecenv.c
-# around an env from envs/ into a library of its own instead, so envs build side
-# by side, and the trainer (src/) loads the one it is asked for.
+# which only an NVIDIA card runs, or into a CPU play binary. This compiles cenv.c
+# around a C env from envs/ into a library of its own instead, so envs build side
+# by side, and the trainer (src/) loads the one it is asked for and steps it in its
+# own vecenv (src/vecenv.rs).
+#
+# A Rust env (envs/<env>/Cargo.toml) has nothing to build here: it is part of the
+# trainer, which cargo builds.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -23,6 +27,10 @@ BUILD=build
 
 if [ ! -d "$ENV_DIR" ]; then
     echo "no env called $ENV in envs/" && exit 1
+fi
+if [ -f "$ENV_DIR/Cargo.toml" ]; then
+    echo "$ENV is a Rust env, built into the trainer: cargo build --release"
+    exit 0
 fi
 if [ ! -f "$PUFFER/src/pufferenv.h" ]; then
     echo "Fetching PufferLib 5.0..."
@@ -47,9 +55,9 @@ case "$(uname -s)" in
         RAYLIB_RELEASE=raylib-5.5_macos
         RAYLIB_SYSTEM=(-framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL)
         SYSTEM_LIBS=()
-        # The vecenv steps envs on OpenMP threads, which Apple clang doesn't ship
-        OMP="$(brew --prefix libomp)"
-        if [ ! -f "$OMP/include/omp.h" ]; then
+        # sm64_tool steps games on OpenMP threads, which Apple clang doesn't ship
+        OMP="$(brew --prefix libomp 2>/dev/null || true)"
+        if [ "$ENV" = sm64 ] && [ ! -f "$OMP/include/omp.h" ]; then
             echo "OpenMP missing: run 'brew install libomp'" && exit 1
         fi
         OMP_FLAGS=(-Xpreprocessor -fopenmp -I"$OMP/include" -L"$OMP/lib" -lomp -Wl,-rpath,"$OMP/lib")
@@ -243,8 +251,8 @@ fi
 echo "Compiling the $ENV env..."
 "$CC" -shared -fPIC -fvisibility=hidden "${CFLAGS[@]}" \
     -DENV_HEADER="\"$ENV_DIR/$ENV.h\"" -DPUFFER_ENV_NAME="\"$ENV\"" \
-    vecenv.c "${RAYLIB_LIBS[@]}" "${OMP_FLAGS[@]}" -lm -o "$BUILD/vecenv_$ENV.$LIB_EXT"
-echo "Built: $BUILD/vecenv_$ENV.$LIB_EXT"
+    cenv.c "${RAYLIB_LIBS[@]}" "${SYSTEM_LIBS[@]+"${SYSTEM_LIBS[@]}"}" -lm -o "$BUILD/cenv_$ENV.$LIB_EXT"
+echo "Built: $BUILD/cenv_$ENV.$LIB_EXT"
 
 if [ "$ENV" = platformer ]; then
     "$CC" "${CFLAGS[@]}" "$ENV_DIR/$ENV.c" "${RAYLIB_LIBS[@]}" -lm -o "$BUILD/$ENV"

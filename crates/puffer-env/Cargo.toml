@@ -1,0 +1,8 @@
+[package]
+name = "puffer-env"
+version = "0.1.0"
+edition = "2021"
+description = "What an env is to pufferl: the trait a Rust env implements, its config and its log"
+
+[lib]
+path = "lib.rs"
