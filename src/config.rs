@@ -76,6 +76,11 @@ impl Ini {
 
     pub fn load(&mut self, path: &Path) {
         let text = fs::read_to_string(path).unwrap_or_else(|e| crate::fail(&format!("{}: {e}", path.display())));
+        self.load_text(&text, &path.display().to_string());
+    }
+
+    /// An ini's text, which origin names in errors
+    pub fn load_text(&mut self, text: &str, origin: &str) {
         let mut current: Option<String> = None;
         for (n, line) in text.lines().enumerate() {
             let s = strip_comment(line).trim();
@@ -89,10 +94,10 @@ impl Ini {
                 continue;
             }
             let Some(section) = &current else {
-                crate::fail(&format!("{}:{}: expected section before key=value", path.display(), n + 1));
+                crate::fail(&format!("{origin}:{}: expected section before key=value", n + 1));
             };
             let Some((key, value)) = s.split_once('=') else {
-                crate::fail(&format!("{}:{}: expected key=value", path.display(), n + 1));
+                crate::fail(&format!("{origin}:{}: expected key=value", n + 1));
             };
             let (key, mut value) = (key.trim(), value.trim());
             let quoted = value.len() >= 2 && (value.starts_with('\'') || value.starts_with('"'))
@@ -195,20 +200,21 @@ impl Ini {
     }
 }
 
-/// default.ini, then envs/ENV/ENV.ini, then each --config FILE in the order given, then
-/// --section.key=value (or --section.key value) from the command line, wherever they are in
-/// it. A key with no section is in [base], and dashes in a key are underscores.
+/// PufferLib 5.0's config/default.ini
+pub const DEFAULT_INI: &str = include_str!("../config/default.ini");
+
+/// PufferLib's default.ini (built in), then the env's own ini, then each --config FILE in the
+/// order given, then --section.key=value (or --section.key value) from the command line,
+/// wherever they are in it. A key with no section is in [base], and dashes in a key are underscores.
 ///
-/// A --config file is a variant of the env's config -- sm64's stars/pss-2.ini, the one star's
-/// clock and respawn -- and may only set keys the configs before it have, as a flag may.
-pub fn load_config(root: &Path, env_name: &str, argv: &[String]) -> Ini {
-    let env_config = root.join("envs").join(env_name).join(format!("{env_name}.ini"));
-    if !env_config.exists() {
-        crate::fail(&format!("no config for {env_name}: {} not found", env_config.display()));
-    }
+/// A --config file is a variant of the env's config -- one level's settings, say -- and may
+/// only set keys the configs before it have, as a flag may.
+///
+/// env_ini is the env's own config, which origin names in errors: its file, say.
+pub fn load_config(env_name: &str, env_ini: &str, origin: &str, argv: &[String]) -> Ini {
     let mut ini = Ini::default();
-    ini.load(&root.join("vendor/PufferLib/config/default.ini"));
-    ini.load(&env_config);
+    ini.load_text(DEFAULT_INI, "config/default.ini");
+    ini.load_text(env_ini, origin);
     ini.put("base.env_name", env_name);
 
     let mut flags = Vec::new();
@@ -260,15 +266,13 @@ mod tests {
     #[test]
     fn overlays() {
         let root = std::env::temp_dir().join(format!("pufferl-config-{}", std::process::id()));
-        fs::create_dir_all(root.join("vendor/PufferLib/config")).unwrap();
-        fs::create_dir_all(root.join("envs/toy")).unwrap();
-        fs::write(root.join("vendor/PufferLib/config/default.ini"), "[base]\nenv_name = None\n[env]\n").unwrap();
-        fs::write(root.join("envs/toy/toy.ini"), "[env]\nstar = a\nclock = 900\nrespawn = 0\n").unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let toy = "[env]\nstar = a\nclock = 900\nrespawn = 0\n";
         let variant = root.join("b.ini");
         fs::write(&variant, "[env]\nstar = b\nclock = 1500\n").unwrap();
         let args: Vec<String> = ["--env.clock", "2000", "--config", variant.to_str().unwrap()]
             .iter().map(|arg| arg.to_string()).collect();
-        let ini = load_config(&root, "toy", &args);
+        let ini = load_config("toy", toy, "toy.ini", &args);
         fs::remove_dir_all(&root).unwrap();
         assert_eq!(ini.raw("env", "star"), Some("b"));
         assert_eq!(ini.raw("env", "clock"), Some("2000"));

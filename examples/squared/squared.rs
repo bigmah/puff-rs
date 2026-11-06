@@ -9,7 +9,7 @@
 //! The target is drawn from this env's own generator, seeded by its index, so a run
 //! repeats but does not draw the C env's targets.
 
-use puffer_env::{Agents, Config, Env, Log};
+use pufferl::env::{Agents, Config, Env, Log};
 
 const EMPTY: u8 = 0;
 const AGENT: u8 = 1;
@@ -30,7 +30,7 @@ impl Squared {
     pub fn new(config: &Config, index: usize) -> Self {
         let size = config.size("size");
         if size < 2 {
-            puffer_env::fail("[env] size should be at least 2");
+            pufferl::env::fail("[env] size should be at least 2");
         }
         Self {
             size,

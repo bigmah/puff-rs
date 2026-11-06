@@ -8,18 +8,23 @@
 //! checkpoints PufferLib's own eval can read, and its dashboard. Like the CUDA trainer it
 //! has no autograd: every backward pass is a kernel written for it (src/kernels).
 //!
-//! Envs step in its own vecenv (src/vecenv.rs). An env is a Rust env, which implements
-//! puffer_env::Env (crates/puffer-env) and is named in src/envs.rs, or a PufferLib 5.0 C
-//! env, which build.sh compiles into a bridge library (cenv.c) that this loads:
+//! An env implements [`env::Env`] (the puffer-env crate, re-exported here). A program adds
+//! its envs to an [`Envs`] by name and hands that to [`cli::main`], which trains or evals the
+//! one the command line names, stepping it in pufferl's own vecenv (src/vecenv.rs):
 //!
-//! ```text
-//! pufferl train platformer [--config FILE ...] [--section.key=value ...]
-//! pufferl eval platformer [latest | MODEL.bin] [--headless] [--config FILE ...] [--section.key=value ...]
+//! ```ignore
+//! use pufferl::{cli, Envs};
+//!
+//! fn main() {
+//!     cli::main(Envs::new().add("squared", include_str!("squared.ini"), Squared::new));
+//! }
 //! ```
+//!
+//! examples/squared is a whole one.
 
 pub mod actor;
-pub mod cenv;
 pub mod checkpoint;
+pub mod cli;
 pub mod config;
 pub mod dashboard;
 pub mod envs;
@@ -30,6 +35,11 @@ pub mod ops;
 pub mod pufferl;
 pub mod rng;
 pub mod vecenv;
+
+/// What an env is: the Env trait, its Config, Log and Agents
+pub use puffer_env as env;
+pub use envs::{Entry, Envs};
+pub use vecenv::VecEnv;
 
 /// Say what is wrong and stop, as sys.exit does with a message.
 pub fn fail(message: &str) -> ! {

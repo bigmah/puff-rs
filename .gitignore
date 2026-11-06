@@ -1,17 +1,8 @@
 .DS_Store
 
-# build.sh output (raylib download, objects, human-play binary)
-build/
-
 # cargo's
 target/
 
 # puffer train output
 checkpoints/
 logs/
-
-# Your own dump of the cartridge, which build.sh reads from sm64.z64 here. No
-# game data goes into git.
-*.z64
-*.n64
-*.v64

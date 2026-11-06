@@ -2,11 +2,8 @@
 name = "puff-rs"
 version = "0.1.0"
 edition = "2021"
-description = "PufferLib 5.0's trainer on wgpu: Metal, Vulkan and DX12 from one program"
-
-[[bin]]
-name = "pufferl"
-path = "src/main.rs"
+description = "PufferLib 5.0 in Rust: its trainer on wgpu (Metal, Vulkan, DX12) and its vecenv, for envs written in Rust"
+repository = "https://github.com/bigmah/puff-rs"
 
 [lib]
 name = "pufferl"
@@ -16,15 +13,17 @@ path = "src/lib.rs"
 wgpu = "30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
-libloading = "0.8"
 libc = "0.2"
 rayon = "1"
 puffer-env = { path = "crates/puffer-env" }
-# Rust envs, by name in src/envs.rs
-squared = { path = "envs/squared" }
 
 [workspace]
-members = [".", "crates/puffer-env", "envs/squared"]
+members = [".", "crates/puffer-env"]
+
+[[example]]
+name = "squared"
+path = "examples/squared/main.rs"
+test = true
 
 [lints.clippy]
 # A remainder reads as the arithmetic it is

@@ -4,13 +4,11 @@
 //! observations, actions, rewards, terminals and action masks of every agent are flat
 //! arrays here, which each env sees its own agents' slices of.
 //!
-//! A Rust env is an [`Env`] registered in src/envs.rs. A C env is a PufferLib 5.0 C env
-//! that build.sh compiles into a bridge library (cenv.c), which src/cenv.rs makes an
-//! [`Env`] of; the stepping, threads and logs here are the same for both.
+//! An env is anything that implements [`Env`]: a Rust env, or one behind a bridge to
+//! another language that makes an [`Env`] of it. The stepping, threads and logs here are
+//! the same for every kind.
 
-use std::path::Path;
-
-use puffer_env::{Agents, Config, Env, Obs};
+use puffer_env::{Agents, Env, Obs};
 use rayon::prelude::*;
 
 /// A vecenv of envs of one kind, whatever kind that is
@@ -35,14 +33,6 @@ pub struct VecEnv {
 }
 
 impl VecEnv {
-    /// The env called env_name: a Rust env if src/envs.rs has one by that name, and
-    /// otherwise the C env build.sh built into build/cenv_<env_name>.
-    pub fn new(root: &Path, env_name: &str, env_config: &[(String, String)], total_agents: usize, num_threads: usize) -> Self {
-        let config = Config::new(env_config.to_vec());
-        crate::envs::native(env_name, &config, total_agents, num_threads)
-            .unwrap_or_else(|| crate::cenv::load(root, env_name, &config, total_agents, num_threads))
-    }
-
     /// Envs made by make(0), make(1), ... until they have total_agents agents between them
     pub fn from_envs<E: Env + 'static>(make: impl FnMut(usize) -> E, total_agents: usize, num_threads: usize) -> Self {
         let envs = Envs::new(make, total_agents, num_threads);

@@ -13,7 +13,9 @@ use crate::dashboard::Dashboard;
 use crate::gpu::Gpu;
 use crate::learner::{Hyper, Learner, LOSS_KEYS};
 use crate::model::{Model, Shapes};
+use crate::envs::Entry;
 use crate::vecenv::VecEnv;
+use puffer_env::Config;
 
 const PERF_KEYS: [&str; 6] = ["rollout", "eval_model", "eval_env", "eval_copy", "train_misc", "train_model"];
 
@@ -111,10 +113,9 @@ pub struct PuffeRL {
 impl PuffeRL {
     /// The env, the policy for it, and a checkpoint into the policy if the config names one.
     /// Eval has no use for a learner, which is most of the memory.
-    pub fn create(root: &Path, gpu: Rc<Gpu>, ini: &Ini, training: bool) -> Self {
-        let env_name = ini.text("base", "env_name");
+    pub fn create(env: &Entry, gpu: Rc<Gpu>, ini: &Ini, training: bool) -> Self {
         let total_agents = ini.size("vec", "total_agents");
-        let vec = VecEnv::new(root, &env_name, ini.section("env"), total_agents, ini.size("vec", "num_threads"));
+        let vec = env.make(&Config::new(ini.section("env").to_vec()), total_agents, ini.size("vec", "num_threads"));
         if vec.act_sizes.iter().sum::<usize>() == vec.act_sizes.len() {
             crate::fail("pufferl only implements discrete actions");
         }
@@ -430,7 +431,7 @@ fn eval_loop(pufferl: &mut PuffeRL, dashboard: &mut Dashboard, render: bool, epi
     }
 }
 
-pub fn run_train(root: &Path, gpu: Rc<Gpu>, mut ini: Ini) {
+pub fn run_train(env: &Entry, gpu: Rc<Gpu>, mut ini: Ini) {
     let (minibatch, horizon, agents) = (ini.size("train", "minibatch_size"), ini.size("train", "horizon"), ini.size("vec", "total_agents"));
     if horizon == 0 || minibatch % horizon != 0 {
         crate::fail("train.minibatch_size must be divisible by train.horizon");
@@ -451,7 +452,7 @@ pub fn run_train(root: &Path, gpu: Rc<Gpu>, mut ini: Ini) {
         fs::create_dir_all(dir).unwrap_or_else(|e| crate::fail(&format!("{}: {e}", dir.display())));
     }
 
-    let mut pufferl = PuffeRL::create(root, gpu.clone(), &ini, true);
+    let mut pufferl = PuffeRL::create(env, gpu.clone(), &ini, true);
     let mut dashboard = Dashboard::new();
     let train_epochs = ini.size("train", "total_timesteps") / pufferl.batch_size;
     let interval = ini.int("base", "checkpoint_interval");
@@ -493,7 +494,7 @@ pub fn run_train(root: &Path, gpu: Rc<Gpu>, mut ini: Ini) {
             pufferl.close();
             drop(pufferl);
             ini.put("vec.total_agents", &eval_agents.to_string());
-            pufferl = PuffeRL::create(root, gpu, &ini, false);
+            pufferl = PuffeRL::create(env, gpu, &ini, false);
             pufferl.model.write_weights(&weights);
         }
         pufferl.restart();
@@ -517,7 +518,7 @@ pub fn run_train(root: &Path, gpu: Rc<Gpu>, mut ini: Ini) {
     fs::write(&path, out).unwrap_or_else(|e| crate::fail(&format!("{}: {e}", path.display())));
 }
 
-pub fn run_eval(root: &Path, gpu: Rc<Gpu>, mut ini: Ini, render: bool) {
+pub fn run_eval(env: &Entry, gpu: Rc<Gpu>, mut ini: Ini, render: bool) {
     if render {
         // One env on screen, a step at a time
         let agents = ini.text("env", "num_agents");
@@ -527,7 +528,7 @@ pub fn run_eval(root: &Path, gpu: Rc<Gpu>, mut ini: Ini, render: bool) {
     }
     ini.put("base.reset_every_horizon", "0");
     let episodes = ini.num("base", "eval_episodes");
-    let mut pufferl = PuffeRL::create(root, gpu, &ini, false);
+    let mut pufferl = PuffeRL::create(env, gpu, &ini, false);
     let log = eval_loop(&mut pufferl, &mut Dashboard::new(), render, episodes, None);
     if !render {
         println!("EVAL env={} score={:.6} perf={:.6} games={} params={}", ini.text("base", "env_name"),
